@@ -10,6 +10,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { DatabaseSync } = require('node:sqlite');
 const { createOnlineFraRelayService } = require('../src/lib/online-fra-relay-service');
+const { LEASE_SCHEMA_VERSION, leaseSigningBytes } = require('../src/lib/online-fra-rendezvous-relay');
 
 let assertions = 0;
 function equal(actual, expected, message) { assertions += 1; assert.equal(actual, expected, message); }
@@ -27,13 +28,16 @@ const authority = crypto.generateKeyPairSync('ed25519');
 const authorityPem = authority.publicKey.export({ type: 'spki', format: 'pem' }).toString();
 
 // A minimal account database with the REAL schema the registry writes.
+// b_pair_id is NULLABLE since the solo-pair change (the server half's
+// contract, through its migrate idiom; every other column unchanged): a solo
+// pair -- one computer -- is a relay_pairs row with b_pair_id NULL.
 const accountDbPath = path.join(root, 'devices.sqlite3');
 {
   const db = new DatabaseSync(accountDbPath);
   db.exec(`CREATE TABLE devices (pair_id TEXT PRIMARY KEY, account_id TEXT NOT NULL, name TEXT NOT NULL,
     enrolled_at_ms INTEGER NOT NULL, revoked_at_ms INTEGER, device_id TEXT, mtls_fingerprint TEXT);`);
   db.exec(`CREATE TABLE relay_pairs (relay_pair_id TEXT PRIMARY KEY, account_id TEXT NOT NULL,
-    a_pair_id TEXT NOT NULL, b_pair_id TEXT NOT NULL, capability_digest TEXT NOT NULL, created_at_ms INTEGER NOT NULL);`);
+    a_pair_id TEXT NOT NULL, b_pair_id TEXT, capability_digest TEXT NOT NULL, created_at_ms INTEGER NOT NULL);`);
   const insertDevice = db.prepare('INSERT INTO devices VALUES (?, ?, ?, 1, NULL, ?, ?)');
   insertDevice.run('pair-' + 'a'.repeat(32), 'account-1', 'Desk', 'device-' + 'a'.repeat(24), 'f'.repeat(64));
   insertDevice.run('pair-' + 'b'.repeat(32), 'account-1', 'Laptop', 'device-' + 'b'.repeat(24), 'e'.repeat(64));
@@ -133,6 +137,41 @@ async function controlCall(port, name, body, token = TOKEN) {
     equal(registered.body.outcome, 'already-registered');
     equal((await controlCall(controlPort, 'health')).body.relay.pairCount, 1);
 
+    /* A SOLO pair -- one computer; machineBId present and null -- registers
+       over the same route as 'registered', and the composed deletion takes it
+       down again. (Nothing restored it at boot: LIVE_PAIRS_SQL and ASK_SQL
+       still join BOTH machines, and the account side's shape for a solo pair
+       is not decided here.) */
+    const solo = await controlCall(controlPort, 'register-pair', {
+      pairId: 'pair-' + '2'.repeat(32), generation: 1, capabilityDigest: DIGEST,
+      machineAId: 'device-' + 'c'.repeat(24), machineBId: null
+    });
+    equal(solo.status, 200);
+    equal(solo.body.outcome, 'registered', 'a solo pair is accepted over the control channel');
+    equal((await controlCall(controlPort, 'health')).body.relay.pairCount, 2);
+    const soloGone = await controlCall(controlPort, 'delete-pair', { pairId: 'pair-' + '2'.repeat(32) });
+    equal(soloGone.body.outcome, 'deleted');
+    equal((await controlCall(controlPort, 'health')).body.relay.pairCount, 1);
+
+    /* OMITTING machineBId is NOT the solo shape. The relay core refuses it
+       (ONLINE_FRA_RELAY_PAIR_INVALID: the key must be present and exactly
+       null -- the server sends `machineBId: null` explicitly), and this route
+       must never answer 'registered' for it. What it answers today, MEASURED:
+       'already-registered'. The catch in actions['register-pair'] maps EVERY
+       ONLINE_FRA_RELAY_PAIR_INVALID raised after a successful initializePair
+       to that outcome -- it was written for the retry-after-restart case and
+       is wider than it. Pre-existing, not changed here; pinned so the next
+       reader is not surprised by it, and so that 'registered' can never be
+       the answer and nothing is registered. */
+    const omitted = await controlCall(controlPort, 'register-pair', {
+      pairId: 'pair-' + '4'.repeat(32), generation: 1, capabilityDigest: DIGEST,
+      machineAId: 'device-' + 'd'.repeat(24)
+    });
+    equal(omitted.status, 200);
+    ok(omitted.body.outcome !== 'registered', 'a register-pair that omits machineBId is never reported registered');
+    equal(omitted.body.outcome, 'already-registered', 'the measured pre-existing answer for an omitted machineBId (see the comment above)');
+    equal((await controlCall(controlPort, 'health')).body.relay.pairCount, 1, 'and nothing was registered');
+
     // Deletion is the composed teardown, idempotent end to end.
     const deleted = await controlCall(controlPort, 'delete-pair', { pairId: 'pair-' + '1'.repeat(32) });
     equal(deleted.status, 200);
@@ -151,6 +190,80 @@ async function controlCall(port, name, body, token = TOKEN) {
     ok(shell.relay.snapshot().maxQueuedBytesPerConnection >= 256 * 1024, 'and the queue chain moved with it');
 
     await shell.stop();
+
+    // --- the SOLO pair, end to end through the shell --------------------------
+    //
+    // The account side's shape (the server half's contract): a relay_pairs row
+    // with b_pair_id NULL. The ASK authority and the boot recovery LEFT JOIN
+    // the B machine, so a solo row is restored and admitted with machineBId
+    // null; a row whose b_pair_id names a missing machine stays refused exactly
+    // as a revoked half is; and revoking the solo's one machine ends admission
+    // exactly as a revoked half does -- at the next ask, at the next lease, and
+    // across a restart.
+    {
+      const SOLO_PAIR = 'pair-' + '2'.repeat(32);
+      const SOLO_DEVICE_ROW = 'pair-' + 's'.repeat(32);
+      const SOLO_DEVICE = 'device-' + 's'.repeat(24);
+      const DANGLING_PAIR = 'pair-' + '3'.repeat(32);
+      {
+        const db = new DatabaseSync(accountDbPath);
+        db.prepare('INSERT INTO devices VALUES (?, ?, ?, 1, NULL, ?, ?)').run(SOLO_DEVICE_ROW, 'account-1', 'Only', SOLO_DEVICE, 'd'.repeat(64));
+        db.prepare('INSERT INTO relay_pairs VALUES (?, ?, ?, NULL, ?, 1)').run(SOLO_PAIR, 'account-1', SOLO_DEVICE_ROW, DIGEST);
+        // A two-machine row whose B names a device row that does not exist: its
+        // own A, so that if the SQL ever let it through it would register and
+        // be counted, rather than being refused for a reused device id.
+        db.prepare('INSERT INTO devices VALUES (?, ?, ?, 1, NULL, ?, ?)').run('pair-' + 'e'.repeat(32), 'account-1', 'Half', 'device-' + 'e'.repeat(24), 'e'.repeat(64));
+        db.prepare('INSERT INTO relay_pairs VALUES (?, ?, ?, ?, ?, 1)').run(DANGLING_PAIR, 'account-1', 'pair-' + 'e'.repeat(32), 'pair-' + 'z'.repeat(32), DIGEST);
+        db.close();
+      }
+      const soloShell = service();
+      const soloStart = await soloShell.start();
+      equal(soloStart.recovery.recovered, 2, 'boot restored the two-machine pair AND the solo row; the dangling row was not restored');
+      equal(soloShell.relay.snapshot().pairCount, 2);
+      equal(soloShell.admissionAuthority({ pairId: SOLO_PAIR }), true, 'a solo row resolves at the ASK');
+      equal(soloShell.admissionAuthority({ pairId: DANGLING_PAIR }), false, 'a non-null B that is missing still refuses');
+      equal(soloShell.admissionAuthority({ pairId: 'pair-' + '1'.repeat(32) }), true, 'and the whole pair beside them still resolves');
+
+      // A signed solo lease admits through the real relay, the real ASK and the
+      // real durable store: machine-a, peerDeviceId null, nobody to pair with.
+      const soloLease = () => {
+        const nowMs = Date.now();
+        const value = {
+          schemaVersion: LEASE_SCHEMA_VERSION, leaseId: `lease_solo_${crypto.randomBytes(4).toString('hex')}`, pairId: SOLO_PAIR,
+          deviceId: SOLO_DEVICE, peerDeviceId: null, endpointRole: 'machine-a', mtlsFingerprint: 'd'.repeat(64),
+          generation: 1, issuedAtMs: nowMs - 1_000, expiresAtMs: nowMs + 60_000,
+          nonce: crypto.randomBytes(24).toString('base64url'),
+          ephemeralX25519PublicKey: crypto.generateKeyPairSync('x25519').publicKey.export({ format: 'der', type: 'spki' }).toString('base64url'),
+          capabilityDigest: DIGEST, signature: Buffer.alloc(64).toString('base64url')
+        };
+        value.signature = crypto.sign(null, leaseSigningBytes(value), authority.privateKey).toString('base64url');
+        return value;
+      };
+      const soloIdentity = { verified: true, authType: 'mtls', deviceId: SOLO_DEVICE, mtlsFingerprint: 'd'.repeat(64) };
+      const admitted = soloShell.relay.connect({ identity: soloIdentity, lease: soloLease() });
+      equal(admitted.endpointRole, 'machine-a');
+      equal(admitted.paired, false, 'admitted, alone, as a solo machine is');
+      soloShell.relay.close(admitted.connectionId);
+
+      // Revoke the solo's one machine, exactly as the account page would.
+      {
+        const db = new DatabaseSync(accountDbPath);
+        db.prepare('UPDATE devices SET revoked_at_ms = 2 WHERE pair_id = ?').run(SOLO_DEVICE_ROW);
+        db.close();
+      }
+      equal(soloShell.admissionAuthority({ pairId: SOLO_PAIR }), false, 'a revoked solo machine refuses at the very next ask -- nothing pushed, nothing restarted');
+      throwsCode(() => soloShell.relay.connect({ identity: soloIdentity, lease: soloLease() }), 'ONLINE_FRA_PAIR_UNAUTHORIZED');
+      await soloShell.stop();
+      const afterRevoke = service();
+      const afterRevokeStart = await afterRevoke.start();
+      equal(afterRevokeStart.recovery.recovered, 1, 'a revoked solo machine is not restored at boot; the two-machine pair still is');
+      await afterRevoke.stop();
+      {
+        const db = new DatabaseSync(accountDbPath);
+        db.prepare('UPDATE devices SET revoked_at_ms = NULL WHERE pair_id = ?').run(SOLO_DEVICE_ROW);
+        db.close();
+      }
+    }
 
     // --- the reporting channel: narrow token, named outcomes, bounded queue --
     {

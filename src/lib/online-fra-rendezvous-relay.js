@@ -14,6 +14,8 @@ const LEASE_SCHEMA_VERSION = 'online-fra-lease.v1';
 // control surface ships at launch). One web slot per pair; a new web
 // connection DISPLACES the old, mirroring the account service's web-session
 // displacement; machine-to-machine routing is untouched by its presence.
+// A pair may be SOLO -- machineBId null, one machine, still one web slot --
+// so a person with one computer connected is served too (see normalizedPair).
 const ENDPOINT_ROLES = Object.freeze(['machine-a', 'machine-b', 'web-client']);
 const MACHINE_ROLES = Object.freeze(['machine-a', 'machine-b']);
 const LEASE_KEYS = Object.freeze([
@@ -84,14 +86,22 @@ function pairKey(pairId, generation) {
   return `${pairId}:${generation}`;
 }
 
+// A SOLO PAIR is a pair whose B side is null. Owner ruling: one connected
+// computer is served in the interface too, so it needs a relay pair of its
+// own, and the relay's part is purely permissive -- accept it, admit it,
+// change nothing about a two-machine pair. The key must be PRESENT and
+// exactly null: exactKeys above still refuses an absent key, so a caller
+// that merely forgot machineBId is never taken as solo by accident, and an
+// undefined value is not null either. Everything else about the shape is
+// the two-machine one.
 function normalizedPair(value, seenDevices) {
   exactKeys(value, ['pairId', 'machineAId', 'machineBId', 'capabilityDigest'], 'ONLINE_FRA_RELAY_PAIR_INVALID');
   const pairId = identifier(value.pairId, 'ONLINE_FRA_RELAY_PAIR_INVALID');
   const machineAId = identifier(value.machineAId, 'ONLINE_FRA_RELAY_PAIR_INVALID');
-  const machineBId = identifier(value.machineBId, 'ONLINE_FRA_RELAY_PAIR_INVALID');
-  if (machineAId === machineBId || seenDevices.has(machineAId) || seenDevices.has(machineBId)) fail('ONLINE_FRA_RELAY_PAIR_INVALID');
+  const machineBId = value.machineBId === null ? null : identifier(value.machineBId, 'ONLINE_FRA_RELAY_PAIR_INVALID');
+  if (machineAId === machineBId || seenDevices.has(machineAId) || (machineBId !== null && seenDevices.has(machineBId))) fail('ONLINE_FRA_RELAY_PAIR_INVALID');
   seenDevices.add(machineAId);
-  seenDevices.add(machineBId);
+  if (machineBId !== null) seenDevices.add(machineBId);
   return Object.freeze({ pairId, machineAId, machineBId, capabilityDigest: digest(value.capabilityDigest, 'ONLINE_FRA_RELAY_PAIR_INVALID') });
 }
 
@@ -108,7 +118,12 @@ function validateLeaseShape(lease) {
   identifier(source.leaseId, 'ONLINE_FRA_LEASE_INVALID');
   identifier(source.pairId, 'ONLINE_FRA_LEASE_INVALID');
   identifier(source.deviceId, 'ONLINE_FRA_LEASE_INVALID');
-  identifier(source.peerDeviceId, 'ONLINE_FRA_LEASE_INVALID');
+  // A machine lease on a SOLO pair has no peer and says so with null; every
+  // other lease -- a two-machine lease, and every web lease -- names one.
+  // The null is admitted here by ROLE only, so a web lease still has to name
+  // the machine it drives; whether null is RIGHT for the pair is the binding
+  // check's question (validateLease), not the shape's.
+  if (source.peerDeviceId !== null || !MACHINE_ROLES.includes(source.endpointRole)) identifier(source.peerDeviceId, 'ONLINE_FRA_LEASE_INVALID');
   if (!ENDPOINT_ROLES.includes(source.endpointRole)) fail('ONLINE_FRA_LEASE_INVALID');
   digest(source.mtlsFingerprint, 'ONLINE_FRA_LEASE_INVALID');
   integer(source.generation, 'ONLINE_FRA_LEASE_INVALID', 1);
@@ -490,12 +505,19 @@ function createOnlineFraRendezvousRelay(options = {}) {
       // The web endpoint is a THIRD party: its device id is minted per lease
       // by the account box and must not collide with either machine, and its
       // peerDeviceId names one of the pair's machines (which one is
-      // informational -- routing may address either).
+      // informational -- routing may address either). On a SOLO pair
+      // machineBId is null and a web peerDeviceId is never null (shape), so
+      // the only machine it can name is machineAId -- the only machine.
       if (source.deviceId === pair.machineAId || source.deviceId === pair.machineBId
           || (source.peerDeviceId !== pair.machineAId && source.peerDeviceId !== pair.machineBId)) {
         fail('ONLINE_FRA_LEASE_BINDING_INVALID');
       }
     } else {
+      // On a SOLO pair the B side is null and this is the whole of the solo
+      // binding rule: machine-a presents deviceId === machineAId and
+      // peerDeviceId === null (a lease naming a peer the pair does not have
+      // is refused here, with this code); machine-b has no device id to
+      // equal, so a machine-b lease against a solo pair is refused here too.
       const expectedDevice = source.endpointRole === 'machine-a' ? pair.machineAId : pair.machineBId;
       const expectedPeer = source.endpointRole === 'machine-a' ? pair.machineBId : pair.machineAId;
       if (source.deviceId !== expectedDevice || source.peerDeviceId !== expectedPeer) fail('ONLINE_FRA_LEASE_BINDING_INVALID');
@@ -742,7 +764,7 @@ function createOnlineFraRendezvousRelay(options = {}) {
     if (pairs.has(pair.pairId)) fail('ONLINE_FRA_RELAY_PAIR_INVALID');
     sink('online_fra.pair.registered', { pairId: pair.pairId, generation });
     seenDevices.add(pair.machineAId);
-    seenDevices.add(pair.machineBId);
+    if (pair.machineBId !== null) seenDevices.add(pair.machineBId);
     pairs.set(pair.pairId, pair);
     return Object.freeze({ pairId: pair.pairId, generation, pairCount: pairs.size });
   }
@@ -763,7 +785,7 @@ function createOnlineFraRendezvousRelay(options = {}) {
     closePair(pairId, generation, reason, false);
     pairs.delete(pairId);
     seenDevices.delete(pair.machineAId);
-    seenDevices.delete(pair.machineBId);
+    if (pair.machineBId !== null) seenDevices.delete(pair.machineBId);
     // After the maps mutate, mirroring revokePair: nothing is left to undo,
     // and a sink failure here must surface rather than resurrect the pair.
     sink('online_fra.pair.retired', { pairId, generation, reason });

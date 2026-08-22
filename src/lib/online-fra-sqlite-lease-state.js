@@ -518,8 +518,16 @@ function createOnlineFraSqliteLeaseState(options = {}) {
     const pairId = identifier(field(input, 'pairId', 'ONLINE_FRA_SQLITE_REQUEST_INVALID'), 'ONLINE_FRA_SQLITE_REQUEST_INVALID');
     const generation = safeInteger(field(input, 'generation', 'ONLINE_FRA_SQLITE_REQUEST_INVALID'), 'ONLINE_FRA_SQLITE_REQUEST_INVALID', 1);
     const deviceId = identifier(field(input, 'deviceId', 'ONLINE_FRA_SQLITE_REQUEST_INVALID'), 'ONLINE_FRA_SQLITE_REQUEST_INVALID');
-    const peerDeviceId = identifier(field(input, 'peerDeviceId', 'ONLINE_FRA_SQLITE_REQUEST_INVALID'), 'ONLINE_FRA_SQLITE_REQUEST_INVALID');
-    if (deviceId === peerDeviceId) fail('ONLINE_FRA_SQLITE_REQUEST_INVALID');
+    // null is a SOLO pair's machine: it has no peer, and the relay's lease
+    // binding has already said so before this is reached. Anything else must
+    // be an identifier and must not be the device itself. Nothing below
+    // stores the peer either way -- only the pair, the nonce hash and the
+    // lease-id hash are written.
+    const peerDeviceId = field(input, 'peerDeviceId', 'ONLINE_FRA_SQLITE_REQUEST_INVALID');
+    if (peerDeviceId !== null) {
+      identifier(peerDeviceId, 'ONLINE_FRA_SQLITE_REQUEST_INVALID');
+      if (deviceId === peerDeviceId) fail('ONLINE_FRA_SQLITE_REQUEST_INVALID');
+    }
     const capabilityDigest = digest(field(input, 'capabilityDigest', 'ONLINE_FRA_SQLITE_REQUEST_INVALID'), 'ONLINE_FRA_SQLITE_REQUEST_INVALID');
     const nonceValue = nonce(field(input, 'nonce', 'ONLINE_FRA_SQLITE_REQUEST_INVALID'), 'ONLINE_FRA_SQLITE_REQUEST_INVALID');
     const expiresAtMs = safeInteger(field(input, 'expiresAtMs', 'ONLINE_FRA_SQLITE_REQUEST_INVALID'), 'ONLINE_FRA_SQLITE_REQUEST_INVALID', 1, MAX_TIMESTAMP);

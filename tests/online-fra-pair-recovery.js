@@ -49,12 +49,21 @@ const DIGEST = 'a'.repeat(64);
 const PAIR = 'pair-recovery-0001';
 const DEVICE_A = 'device-aaaa0000aaaa0000aaaa0000';
 const DEVICE_B = 'device-bbbb1111bbbb1111bbbb1111';
+/* The SOLO shapes: one computer is a relay_pairs row with b_pair_id NULL (the
+   server half's contract); a row whose b_pair_id names a machine that does not
+   exist is NOT solo and must stay refused exactly as a revoked half is. */
+const PAIR_SOLO = 'pair-recovery-solo';
+const DEVICE_S = 'device-ssss2222ssss2222ssss2222';
+const PAIR_DANGLING = 'pair-recovery-dangling';
+const DEVICE_E = 'device-eeee3333eeee3333eeee3333';
 
 /* The account service's own schema, as the relay reads it. Written here rather
    than imported because the relay must keep working against the database the
    account service already has -- if these columns drift, this test is where the
-   relay finds out, which is the point. */
-function seedAccountDb({ revokeB = false } = {}) {
+   relay finds out, which is the point. b_pair_id is NULLABLE since the solo-pair
+   change (the server half makes it so through its migrate idiom; every other
+   column is unchanged): a solo pair is a row with b_pair_id NULL. */
+function seedAccountDb({ revokeB = false, solo = false, revokeSolo = false, danglingB = false } = {}) {
   const db = new DatabaseSync(accountDbPath);
   db.exec(`CREATE TABLE IF NOT EXISTS devices (
     pair_id TEXT PRIMARY KEY, account_id TEXT NOT NULL, name TEXT NOT NULL,
@@ -62,15 +71,23 @@ function seedAccountDb({ revokeB = false } = {}) {
     mtls_fingerprint TEXT, ed25519_public_key TEXT)`);
   db.exec(`CREATE TABLE IF NOT EXISTS relay_pairs (
     relay_pair_id TEXT PRIMARY KEY, account_id TEXT NOT NULL,
-    a_pair_id TEXT NOT NULL, b_pair_id TEXT NOT NULL,
+    a_pair_id TEXT NOT NULL, b_pair_id TEXT,
     capability_digest TEXT NOT NULL, created_at_ms INTEGER NOT NULL)`);
   db.exec('DELETE FROM relay_pairs');
   db.exec('DELETE FROM devices');
   const device = db.prepare('INSERT INTO devices (pair_id, account_id, name, enrolled_at_ms, revoked_at_ms, device_id) VALUES (?,?,?,?,?,?)');
+  const relayPair = db.prepare('INSERT INTO relay_pairs (relay_pair_id, account_id, a_pair_id, b_pair_id, capability_digest, created_at_ms) VALUES (?,?,?,?,?,?)');
   device.run('pair-a', 'acct-1', 'Desk', 1, null, DEVICE_A);
   device.run('pair-b', 'acct-1', 'Laptop', 1, revokeB ? 2 : null, DEVICE_B);
-  db.prepare('INSERT INTO relay_pairs (relay_pair_id, account_id, a_pair_id, b_pair_id, capability_digest, created_at_ms) VALUES (?,?,?,?,?,?)')
-    .run(PAIR, 'acct-1', 'pair-a', 'pair-b', DIGEST, 1);
+  relayPair.run(PAIR, 'acct-1', 'pair-a', 'pair-b', DIGEST, 1);
+  if (solo) {
+    device.run('pair-s', 'acct-1', 'Only', 1, revokeSolo ? 2 : null, DEVICE_S);
+    relayPair.run(PAIR_SOLO, 'acct-1', 'pair-s', null, DIGEST, 1);
+  }
+  if (danglingB) {
+    device.run('pair-e', 'acct-1', 'Half', 1, null, DEVICE_E);
+    relayPair.run(PAIR_DANGLING, 'acct-1', 'pair-e', 'pair-missing', DIGEST, 1);
+  }
   db.close();
 }
 
@@ -118,6 +135,45 @@ function makeService() {
     'a pair whose machine has been revoked was restored; the account service is the authority on who is still enrolled, and it said no');
   equal(thirdStart.recovery.recovered, 0);
   await third.stop();
+
+  // --- a SOLO pair -- b_pair_id NULL -- is restored beside the pair, and survives a restart ---
+  seedAccountDb({ solo: true });
+  const soloFirst = makeService();
+  const soloFirstStart = await soloFirst.start();
+  equal(soloFirst.relay.snapshot().pairCount, 2,
+    'the solo row -- one machine, b_pair_id NULL -- was not restored beside the two-machine pair; a person with one computer stays dark after every restart');
+  equal(soloFirstStart.recovery.recovered, 2);
+  equal(soloFirstStart.recovery.conflicts, 0);
+  equal(soloFirstStart.recovery.skipped, 0, 'restored as a SOLO pair (machineBId null), not skipped as a malformed one');
+  equal(soloFirst.admissionAuthority({ pairId: PAIR_SOLO }), true, 'and the ASK authority resolves the solo row');
+  await soloFirst.stop();
+  const soloAgain = makeService();
+  const soloAgainStart = await soloAgain.start();
+  equal(soloAgain.relay.snapshot().pairCount, 2, 'the solo pair did not survive a restart');
+  equal(soloAgainStart.recovery.recovered, 2);
+  equal(soloAgainStart.recovery.conflicts, 0);
+  await soloAgain.stop();
+
+  // --- revoking a solo's ONE machine ends it exactly as a revoked half ends a pair ---
+  seedAccountDb({ solo: true, revokeSolo: true });
+  const soloRevoked = makeService();
+  const soloRevokedStart = await soloRevoked.start();
+  equal(soloRevoked.relay.snapshot().pairCount, 1,
+    'a solo pair whose one machine has been revoked was restored; the account service said no and the relay must not say yes');
+  equal(soloRevokedStart.recovery.recovered, 1);
+  equal(soloRevoked.admissionAuthority({ pairId: PAIR_SOLO }), false);
+  await soloRevoked.stop();
+
+  // --- a non-null B that names a missing machine is NOT a solo pair: refused, not restored ---
+  seedAccountDb({ danglingB: true });
+  const dangling = makeService();
+  const danglingStart = await dangling.start();
+  equal(dangling.relay.snapshot().pairCount, 1,
+    'a two-machine row whose B device is missing was restored as if it were solo -- the LEFT JOIN must excuse only a NULL b_pair_id');
+  equal(danglingStart.recovery.recovered, 1);
+  equal(dangling.admissionAuthority({ pairId: PAIR_DANGLING }), false);
+  equal(dangling.admissionAuthority({ pairId: PAIR }), true, 'while the whole pair beside it still resolves');
+  await dangling.stop();
 
   // --- an unreadable account database refuses honestly and still boots ------
   fs.rmSync(accountDbPath);

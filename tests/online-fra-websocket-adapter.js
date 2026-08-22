@@ -136,6 +136,83 @@ function upgrade(test, request = { method: 'GET', url: '/v1/rendezvous' }, ws = 
     equal(realRelay.snapshot().activeConnections, 1); ws.emit('close'); equal(realRelay.snapshot().activeConnections, 0);
   }
 
+  // A SOLO PAIR THROUGH THE REAL EDGE AND THE REAL RELAY. One machine (the
+  // certificate door) and its browser (the key door) on a pair whose B side
+  // is null. The browser's first frame lands on the machine's socket before
+  // the machine has sent a single byte -- the relay waits for no hello and no
+  // peer -- and a frame addressed to the machine-b leg, which a solo pair will
+  // never have, is dropped and counted exactly as an absent peer is, with the
+  // browser's socket kept. No log line names a null or undefined side.
+  {
+    const { createOnlineFraWebAdmission } = require('../src/lib/online-fra-web-admission');
+    const authority = crypto.generateKeyPairSync('ed25519');
+    const pair = { pairId: 'pair-solo', machineAId: 'device-solo', machineBId: null, capabilityDigest: '2'.repeat(64) };
+    const state = {
+      admitLease: () => ({ ok: true, outcome: 'accepted' }),
+      pairState: () => ({ ok: true, revoked: false }),
+      revokePair: () => ({ ok: true, revoked: true })
+    };
+    const soloRelay = createOnlineFraRendezvousRelay({
+      enabled: true, authorityPublicKey: authority.publicKey, generation: 1, pairs: [pair],
+      clock: () => 1_000_000, eventSink: () => {}, leaseState: state
+    });
+    const signedLease = fields => {
+      const value = {
+        schemaVersion: LEASE_SCHEMA_VERSION, leaseId: `lease_${crypto.randomBytes(4).toString('hex')}`, pairId: pair.pairId,
+        generation: 1, issuedAtMs: 999_990, expiresAtMs: 1_060_000,
+        nonce: crypto.randomBytes(24).toString('base64url'),
+        ephemeralX25519PublicKey: crypto.generateKeyPairSync('x25519').publicKey.export({ format: 'der', type: 'spki' }).toString('base64url'),
+        capabilityDigest: pair.capabilityDigest, signature: Buffer.alloc(64).toString('base64url'), ...fields
+      };
+      value.signature = crypto.sign(null, leaseSigningBytes(value), authority.privateKey).toString('base64url');
+      return value;
+    };
+    const browser = crypto.generateKeyPairSync('ed25519');
+    const browserSpki = browser.publicKey.export({ type: 'spki', format: 'der' });
+    const machineLease = signedLease({ deviceId: 'device-solo', peerDeviceId: null, endpointRole: 'machine-a', mtlsFingerprint: 'a'.repeat(64) });
+    const webLease = signedLease({ deviceId: `web-${'7'.repeat(24)}`, peerDeviceId: 'device-solo', endpointRole: 'web-client', mtlsFingerprint: crypto.createHash('sha256').update(browserSpki).digest('hex') });
+    const logs = [];
+    const solo = fixture({
+      relay: soloRelay, keyAdmission: createOnlineFraWebAdmission({ relay: soloRelay, clock: () => 1 }),
+      maxAdmissionBytes: 8192, maxSockets: 4, maxSocketsPerIp: 2, maxAdmissionsPerIp: 4,
+      // The machine presents a certificate; the browser cannot and takes the key door.
+      verifyProxyRequest: req => (req.certificate
+        ? { ok: true, tlsSni: 'fra-relay.devices.example.net', clientVerify: 'SUCCESS', deviceId: 'device-solo', fingerprint: 'a'.repeat(64), ip: '10.0.0.40' }
+        : { ok: false }),
+      clientIpFor: () => '10.0.0.41',
+      log: line => logs.push(line)
+    });
+    solo.adapter.start();
+    const machine = upgrade(solo, { method: 'GET', url: '/v1/rendezvous', certificate: true });
+    machine.ws.emit('message', Buffer.from(JSON.stringify({ lease: machineLease })), false);
+    equal(machine.ws.closed.length, 0, 'the solo machine is admitted with a null peer');
+    equal(soloRelay.snapshot().activeConnections, 1);
+    const web = upgrade(solo);
+    const challenge = JSON.parse(web.ws.sent[0].data.toString('utf8')).challenge;
+    web.ws.emit('message', Buffer.from(JSON.stringify({
+      lease: webLease, publicKeySpki: browserSpki.toString('base64url'), nonce: challenge,
+      signature: crypto.sign(null, Buffer.from(challenge, 'base64url'), browser.privateKey).toString('base64url')
+    })), false);
+    equal(web.ws.readyState, 1, 'the browser is admitted beside the one machine');
+    equal(soloRelay.snapshot().activeConnections, 2);
+    equal(machine.ws.sent.length, 0, 'precondition: the machine has not sent a byte');
+    web.ws.emit('message', Buffer.concat([Buffer.from([0x01]), Buffer.from('hello-solo')]), true);
+    equal(machine.ws.sent.length, 1, 'delivered to the one machine without waiting for a hello from it');
+    equal(machine.ws.sent[0].data[0], 0x03, 'stamped with the web source leg');
+    equal(machine.ws.sent[0].data.subarray(1).toString(), 'hello-solo');
+    machine.ws.emit('message', Buffer.concat([Buffer.from([0x03]), Buffer.from('answer')]), true);
+    equal(web.ws.sent.length, 2, 'the answer reached the browser (its first send was the challenge)');
+    equal(web.ws.sent[1].data[0], 0x01);
+    equal(web.ws.sent[1].data.subarray(1).toString(), 'answer');
+    web.ws.emit('message', Buffer.concat([Buffer.from([0x02]), Buffer.from('nobody')]), true);
+    equal(web.ws.readyState, 1, 'addressing the B leg a solo pair never has does not cost the browser its socket');
+    equal(solo.events.filter(e => e.type === 'online_fra.ws.frame_dropped' && e.reason === 'leg_absent').length, 1, 'it is counted');
+    ok(logs.some(line => line.startsWith('frame dropped: no machine-b leg')), 'and said out loud once');
+    machine.ws.emit('close'); web.ws.emit('close');
+    equal(soloRelay.snapshot().activeConnections, 0);
+    ok(!logs.some(line => /\bnull\b|undefined/.test(line)), 'no log line of a solo pair prints a null or undefined side');
+  }
+
   // KEY-POSSESSION MODE. No certificate: the request carries no attestation, so
   // with `keyAdmission` configured the socket is admitted provisionally, the
   // edge's FIRST frame is the challenge, and the endpoint's first frame is the

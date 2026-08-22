@@ -18,8 +18,10 @@
 // unreadable database refuses admission rather than guessing.
 //
 // The SQL restates device-registry.js accountForRelayPair() semantics -- a
-// pair resolves only while BOTH machines are unrevoked -- and the cross-repo
-// seam test is what keeps the restatement honest.
+// pair resolves only while BOTH machines are unrevoked, or, for a SOLO pair
+// (one computer: a relay_pairs row with b_pair_id NULL), while its one
+// machine is -- and the cross-repo seam test is what keeps the restatement
+// honest.
 
 const crypto = require('node:crypto');
 const fs = require('node:fs');
@@ -30,20 +32,32 @@ const { createOnlineFraRendezvousRelay } = require('./online-fra-rendezvous-rela
 const { createOnlineFraSqliteLeaseState } = require('./online-fra-sqlite-lease-state');
 const { createOnlineFraMetadataSink } = require('./online-fra-metadata-sink');
 
+/* THE B MACHINE IS A LEFT JOIN, because a pair may be SOLO. The account side
+   (the server half's contract) stores a solo pair as a relay_pairs row with
+   b_pair_id NULL -- one computer, no half; every other column is unchanged.
+   The WHERE clause is what keeps the old rule intact for every row that DOES
+   name a B: a non-null b_pair_id whose device is missing or revoked leaves
+   b.pair_id NULL and is refused exactly as the inner join refused it. Only a
+   NULL b_pair_id is excused from needing one, and revoking a solo's one
+   machine refuses at the A join exactly as a revoked half does. */
 const ASK_SQL = `SELECT rp.account_id AS accountId FROM relay_pairs rp
   JOIN devices a ON a.pair_id = rp.a_pair_id AND a.revoked_at_ms IS NULL
-  JOIN devices b ON b.pair_id = rp.b_pair_id AND b.revoked_at_ms IS NULL
-  WHERE rp.relay_pair_id = ?`;
+  LEFT JOIN devices b ON b.pair_id = rp.b_pair_id AND b.revoked_at_ms IS NULL
+  WHERE rp.relay_pair_id = ? AND (rp.b_pair_id IS NULL OR b.pair_id IS NOT NULL)`;
 
-/* EVERY LIVE PAIR, FOR THE RECOVERY BELOW. The same join the ASK authority
+/* EVERY LIVE PAIR, FOR THE RECOVERY BELOW. The same joins the ASK authority
    makes, without the id filter: a pair is live when both its machines are
-   still enrolled, and the account service is the one that decides that. */
+   still enrolled -- or, for a SOLO row (b_pair_id NULL), when its one machine
+   is -- and the account service is the one that decides that. A solo row
+   comes back with machineBId NULL, which is exactly the shape registerPair
+   takes for a solo pair; a row naming a B that is missing, revoked or not yet
+   carrying a device id is excluded exactly as before. */
 const LIVE_PAIRS_SQL = `SELECT rp.relay_pair_id AS pairId, rp.capability_digest AS capabilityDigest,
     a.device_id AS machineAId, b.device_id AS machineBId
   FROM relay_pairs rp
   JOIN devices a ON a.pair_id = rp.a_pair_id AND a.revoked_at_ms IS NULL
-  JOIN devices b ON b.pair_id = rp.b_pair_id AND b.revoked_at_ms IS NULL
-  WHERE a.device_id IS NOT NULL AND b.device_id IS NOT NULL`;
+  LEFT JOIN devices b ON b.pair_id = rp.b_pair_id AND b.revoked_at_ms IS NULL
+  WHERE a.device_id IS NOT NULL AND (rp.b_pair_id IS NULL OR b.device_id IS NOT NULL)`;
 
 class OnlineFraRelayServiceError extends Error {
   constructor(code, message) {

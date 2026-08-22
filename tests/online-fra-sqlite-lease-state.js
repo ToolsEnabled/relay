@@ -161,6 +161,12 @@ try {
     throws(() => malformed.revokePair({ pairId: 'pair-alpha', generation: 1, reason: `${MARKER} !` }), error => error && error.code === 'ONLINE_FRA_SQLITE_REQUEST_INVALID');
     const hostileRequest = new Proxy(request(), { get(target, key) { if (key === 'nonce') throw new Error(MARKER); return target[key]; } });
     throws(() => malformed.admitLease(hostileRequest), error => error && error.code === 'ONLINE_FRA_SQLITE_REQUEST_INVALID' && !error.message.includes(MARKER));
+    // A SOLO pair's machine lease carries peerDeviceId null (it has no peer):
+    // the store admits it -- it never stored the peer anyway -- while a peer
+    // that is the device itself, or an undefined one, is still refused.
+    deepEqual(malformed.admitLease(request({ leaseId: 'lease-solo', peerDeviceId: null, nonce: Buffer.alloc(16, 31).toString('base64url') })), { ok: true, outcome: 'accepted' });
+    throws(() => malformed.admitLease(request({ peerDeviceId: 'device-alpha', nonce: Buffer.alloc(16, 32).toString('base64url') })), error => error && error.code === 'ONLINE_FRA_SQLITE_REQUEST_INVALID');
+    throws(() => malformed.admitLease(request({ peerDeviceId: undefined })), error => error && error.code === 'ONLINE_FRA_SQLITE_REQUEST_INVALID');
     equal(malformed.close(), true);
   }
 
@@ -310,7 +316,10 @@ try {
     const ephemeral = crypto.generateKeyPairSync('x25519').publicKey.export({ format: 'der', type: 'spki' }).toString('base64url');
     const relayOptions = {
       enabled: true, authorityPublicKey: authority.publicKey, verifyLease: () => true, leaseState,
-      clock: () => now, eventSink: () => {}, pairs: [{ pairId: 'pair-alpha', machineAId: 'device-alpha', machineBId: 'device-bravo', capabilityDigest: DIGEST }]
+      clock: () => now, eventSink: () => {}, pairs: [
+        { pairId: 'pair-alpha', machineAId: 'device-alpha', machineBId: 'device-bravo', capabilityDigest: DIGEST },
+        { pairId: 'pair-solo', machineAId: 'device-solo', machineBId: null, capabilityDigest: DIGEST }
+      ]
     };
     const relayA = createOnlineFraRendezvousRelay(relayOptions);
     const relayB = createOnlineFraRendezvousRelay(relayOptions);
@@ -322,6 +331,14 @@ try {
     const identity = { verified: true, authType: 'mtls', deviceId: 'device-alpha', mtlsFingerprint: 'c'.repeat(64) };
     ok(relayA.connect({ identity, lease }).connectionId.startsWith('conn_'));
     throws(() => relayB.connect({ identity, lease }), error => error && error.code === 'ONLINE_FRA_LEASE_REPLAYED');
+    // The real store behind a SOLO pair: the relay hands it a machine lease
+    // with no peer, and the admission -- and the replay refusal -- are the
+    // same as for a pair.
+    deepEqual(leaseState.initializePair(pair({ pairId: 'pair-solo' })), { ok: true, outcome: 'initialized', generation: 1 });
+    const soloLease = { ...lease, leaseId: 'lease-solo-relay', pairId: 'pair-solo', deviceId: 'device-solo', peerDeviceId: null, nonce: Buffer.alloc(16, 33).toString('base64url') };
+    const soloIdentity = { verified: true, authType: 'mtls', deviceId: 'device-solo', mtlsFingerprint: 'c'.repeat(64) };
+    ok(relayA.connect({ identity: soloIdentity, lease: soloLease }).connectionId.startsWith('conn_'));
+    throws(() => relayB.connect({ identity: soloIdentity, lease: soloLease }), error => error && error.code === 'ONLINE_FRA_LEASE_REPLAYED');
     equal(leaseState.close(), true);
   }
 

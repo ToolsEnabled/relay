@@ -713,6 +713,136 @@ function run() {
     equal(instance.snapshot().activeConnections >= 3, true);
   }
 
+  // --- the solo pair: one computer, served ----------------------------------
+  //
+  // Owner ruling: "If theres only one computer connected we need to serve that
+  // one computer in the interface. If there's two we need to serve both in the
+  // interface and both need to be controllable." The relay's half is
+  // PERMISSIVE only: a pair whose B side is null -- present and exactly null
+  // -- registers, its one machine admits with a null peer, its web slot
+  // addresses that one machine, and nothing about a two-machine pair moves
+  // (every section above is the proof of that, and none of them changed).
+  {
+    const pairSolo = Object.freeze({ pairId: 'pair-solo', machineAId: 'machine-solo', machineBId: null, capabilityDigest: digestOne });
+    const soloIdentity = (leaseValue, overrides = {}) => identity(leaseValue.deviceId, leaseValue.mtlsFingerprint, overrides);
+
+    // Registration: at construction and at runtime, with the usual receipt.
+    {
+      const events = [];
+      const constructed = relay({ events, pairs: [pairOne, pairSolo] });
+      equal(constructed.snapshot().pairCount, 2, 'a solo pair constructs beside a two-machine one');
+      const instance = relay({ events });
+      const receipt = instance.registerPair(pairSolo);
+      equal(receipt.pairId, 'pair-solo');
+      equal(receipt.pairCount, 2, 'a solo pair registers at runtime like any other');
+      ok(events.some(event => event.type === 'online_fra.pair.registered' && event.pairId === 'pair-solo'), 'and is audited the same way');
+    }
+
+    // The key must be PRESENT and null. An absent key is still the old
+    // refusal, so a caller that forgot machineBId is never taken as solo; an
+    // undefined value is not null either. Device ids stay globally unique
+    // across solo and two-machine pairs alike.
+    {
+      const instance = relay({});
+      code(() => instance.registerPair({ pairId: 'pair-solo', machineAId: 'machine-solo', capabilityDigest: digestOne }), 'ONLINE_FRA_RELAY_PAIR_INVALID');
+      code(() => instance.registerPair({ pairId: 'pair-solo', machineAId: 'machine-solo', machineBId: undefined, capabilityDigest: digestOne }), 'ONLINE_FRA_RELAY_PAIR_INVALID');
+      code(() => relay({ pairs: [{ pairId: 'pair-solo', machineAId: 'machine-solo', capabilityDigest: digestOne }] }), 'ONLINE_FRA_RELAY_PAIR_INVALID');
+      code(() => instance.registerPair({ ...pairSolo, machineAId: pairOne.machineBId }), 'ONLINE_FRA_RELAY_PAIR_INVALID');
+      instance.registerPair(pairSolo);
+      code(() => instance.registerPair({ pairId: 'pair-gh', machineAId: 'machine-g', machineBId: pairSolo.machineAId, capabilityDigest: digestOne }), 'ONLINE_FRA_RELAY_PAIR_INVALID');
+      code(() => instance.registerPair({ pairId: 'pair-solo-2', machineAId: pairSolo.machineAId, machineBId: null, capabilityDigest: digestOne }), 'ONLINE_FRA_RELAY_PAIR_INVALID');
+      equal(instance.snapshot().pairCount, 2, 'every refusal above left no trace');
+    }
+
+    // Machine admission: machine-a with peerDeviceId null admits, unpaired,
+    // with no machine-b leg. A lease NAMING a peer the pair does not have is
+    // refused at binding; so is a machine-b lease, because there is no B; so
+    // is a null peer on a TWO-machine pair (the lease says "no peer" about a
+    // pair that has one); and a WEB lease never gets to say null at all --
+    // its shape still names the machine it drives.
+    {
+      const events = [];
+      const instance = relay({ events, pairs: [pairSolo] });
+      const soloLease = lease({ pair: pairSolo, role: 'machine-a' });
+      equal(soloLease.peerDeviceId, null, 'precondition: the fixture mints a null peer for a solo machine');
+      const a = instance.connect({ identity: soloIdentity(soloLease), lease: soloLease });
+      equal(a.endpointRole, 'machine-a');
+      equal(a.paired, false, 'a solo machine is admitted and is not paired -- there is nobody to pair with');
+      const meta = instance.connectionMetadata(a.connectionId);
+      equal(meta.peerConnectionId, null);
+      equal(meta.peerDeviceId, null);
+      equal(meta.legs['machine-a'], a.connectionId);
+      equal(meta.legs['machine-b'], null, 'the B leg is absent, not an error');
+      const namedPeer = lease({ pair: pairSolo, role: 'machine-a', overrides: { peerDeviceId: 'machine-b' } });
+      code(() => instance.connect({ identity: soloIdentity(namedPeer), lease: namedPeer }), 'ONLINE_FRA_LEASE_BINDING_INVALID');
+      const asB = lease({ pair: pairSolo, role: 'machine-b', overrides: { deviceId: 'machine-ghost', peerDeviceId: pairSolo.machineAId } });
+      code(() => instance.connect({ identity: soloIdentity(asB), lease: asB }), 'ONLINE_FRA_LEASE_BINDING_INVALID');
+      const twoMachine = relay({});
+      const nullOnPair = lease({ pair: pairOne, role: 'machine-a', overrides: { peerDeviceId: null } });
+      code(() => twoMachine.connect({ identity: soloIdentity(nullOnPair), lease: nullOnPair }), 'ONLINE_FRA_LEASE_BINDING_INVALID');
+      const webNull = lease({ pair: pairOne, role: 'machine-a', overrides: { endpointRole: 'web-client', deviceId: `web-${'a'.repeat(24)}`, peerDeviceId: null } });
+      code(() => twoMachine.connect({ identity: soloIdentity(webNull, { authType: 'web-lease' }), lease: webNull }), 'ONLINE_FRA_LEASE_INVALID');
+      equal(instance.snapshot().activeConnections, 1, 'only the solo machine is connected');
+      ok(!/\bnull\b|undefined/.test(JSON.stringify(events)), 'no event summarising the solo pair prints a null or undefined side');
+    }
+
+    // The web slot on a solo pair addresses the ONE machine, and the relay
+    // waits for nothing: the browser is admitted before the machine, its
+    // first frame reaches the machine before the machine has sent a byte,
+    // and the machine's answer reaches the browser the same way. A web lease
+    // naming a peer the pair does not have is refused; displacement still
+    // works; and the per-pair floor was NOT lowered to make room for any of
+    // this -- one machine plus one web slot is all a solo pair ever holds.
+    {
+      const webKey = crypto.generateKeyPairSync('ed25519');
+      const webFingerprint = crypto.createHash('sha256').update(webKey.publicKey.export({ type: 'spki', format: 'der' })).digest('hex');
+      const webLease = (overrides = {}) => lease({ pair: pairSolo, role: 'machine-a', overrides: {
+        endpointRole: 'web-client', deviceId: `web-${'5'.repeat(24)}`, peerDeviceId: pairSolo.machineAId, mtlsFingerprint: webFingerprint, ...overrides
+      } });
+      const webIdentity = leaseValue => ({ verified: true, authType: 'web-lease', deviceId: leaseValue.deviceId, mtlsFingerprint: leaseValue.mtlsFingerprint });
+      const events = [];
+      const instance = relay({ events, pairs: [pairSolo] });
+      const wl = webLease();
+      const web = instance.connect({ identity: webIdentity(wl), lease: wl });
+      equal(web.paired, false, 'admitted first, with no machine present yet');
+      const soloLease = lease({ pair: pairSolo, role: 'machine-a' });
+      const a = instance.connect({ identity: soloIdentity(soloLease), lease: soloLease });
+      equal(instance.connectionMetadata(web.connectionId).legs['machine-a'], a.connectionId, 'the browser can see the one machine leg');
+      equal(instance.connectionMetadata(web.connectionId).legs['machine-b'], null);
+      equal(instance.take(a.connectionId), null, 'precondition: the machine has neither sent nor received anything');
+      equal(instance.route({ connectionId: web.connectionId, peerConnectionId: a.connectionId, frame: Buffer.from('hello-from-browser') }).delivered, true);
+      deepEqual(instance.take(a.connectionId), Buffer.from('hello-from-browser'), 'delivered without any hello from the machine leg first');
+      equal(instance.route({ connectionId: a.connectionId, peerConnectionId: web.connectionId, frame: Buffer.from('hello-from-machine') }).delivered, true);
+      deepEqual(instance.take(web.connectionId), Buffer.from('hello-from-machine'));
+      const elsewhere = webLease({ peerDeviceId: 'machine-b' });
+      code(() => instance.connect({ identity: webIdentity(elsewhere), lease: elsewhere }), 'ONLINE_FRA_LEASE_BINDING_INVALID');
+      const second = webLease({ deviceId: `web-${'6'.repeat(24)}` });
+      const replaced = instance.connect({ identity: webIdentity(second), lease: second });
+      code(() => instance.connectionMetadata(web.connectionId), 'ONLINE_FRA_WEB_DISPLACED');
+      equal(instance.connectionMetadata(replaced.connectionId).endpointRole, 'web-client');
+      equal(instance.snapshot().activeConnections, 2);
+      code(() => relay({ maxConnectionsPerPair: 1 }), 'ONLINE_FRA_RELAY_CAPACITY_INVALID');
+      ok(!/\bnull\b|undefined/.test(JSON.stringify(events)), 'the accepted/routed/dequeued/closed events of a solo pair name no null side');
+    }
+
+    // Retirement frees the solo machine's id for a later registration -- as
+    // the B of a two-machine pair, or as a solo again -- and an open solo
+    // connection is closed with the retirement named, exactly as for a pair.
+    {
+      const instance = relay({});
+      instance.registerPair(pairSolo);
+      const soloLease = lease({ pair: pairSolo, role: 'machine-a' });
+      const a = instance.connect({ identity: soloIdentity(soloLease), lease: soloLease });
+      code(() => instance.registerPair({ pairId: 'pair-reuse', machineAId: 'machine-r', machineBId: pairSolo.machineAId, capabilityDigest: digestOne }), 'ONLINE_FRA_RELAY_PAIR_INVALID');
+      equal(instance.retirePair({ pairId: 'pair-solo' }), true);
+      code(() => instance.connectionMetadata(a.connectionId), 'ONLINE_FRA_PAIR_RETIRED');
+      instance.registerPair({ pairId: 'pair-reuse', machineAId: 'machine-r', machineBId: pairSolo.machineAId, capabilityDigest: digestOne });
+      equal(instance.retirePair({ pairId: 'pair-reuse' }), true);
+      instance.registerPair(pairSolo);
+      equal(instance.snapshot().pairCount, 2, 'the freed id registered again: as the B of a pair, then as a solo');
+    }
+  }
+
   console.log(`online FRA rendezvous relay tests passed (${assertions} assertions).`);
 }
 
