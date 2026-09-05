@@ -45,6 +45,11 @@ const ASK_SQL = `SELECT rp.account_id AS accountId FROM relay_pairs rp
   LEFT JOIN devices b ON b.pair_id = rp.b_pair_id AND b.revoked_at_ms IS NULL
   WHERE rp.relay_pair_id = ? AND (rp.b_pair_id IS NULL OR b.pair_id IS NOT NULL)`;
 
+// The browser introduction is withdrawn by the account service on sign-out.
+// It lives in this same device database; no account/session database is opened.
+const WEB_SESSION_SQL = `SELECT 1 FROM relay_web_sessions
+  WHERE relay_pair_id = ? AND web_device_id = ? AND account_id = ? AND expires_at_ms > ?`;
+
 /* EVERY LIVE PAIR, FOR THE RECOVERY BELOW. The same joins the ASK authority
    makes, without the id filter: a pair is live when both its machines are
    still enrolled -- or, for a SOLO row (b_pair_id NULL), when its one machine
@@ -119,7 +124,12 @@ function createOnlineFraRelayService(config = {}) {
     try {
       if (!accountDb) return false;
       const row = accountDb.prepare(ASK_SQL).get(request.pairId);
-      return Boolean(row && typeof row.accountId === 'string' && row.accountId.length > 0);
+      if (!row || typeof row.accountId !== 'string' || row.accountId.length === 0) return false;
+      if (request.endpointRole === 'web-client') {
+        return Boolean(accountDb.prepare(WEB_SESSION_SQL).get(
+          request.pairId, request.deviceId, row.accountId, Date.now()));
+      }
+      return true;
     } catch {
       // Unreadable is a refusal, never a guess -- and never a crash: a
       // throwing authority would refuse with a stack instead of a code.

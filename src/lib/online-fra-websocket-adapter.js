@@ -65,6 +65,9 @@ const DEFAULTS = Object.freeze({
   log: () => {}
 });
 
+// Recheck admitted authority even when no frames arrive or a socket is full.
+const SESSION_RECHECK_MS = 1_000;
+
 class OnlineFraWebSocketAdapterError extends Error {
   constructor(code) { super(code); this.name = 'OnlineFraWebSocketAdapterError'; this.code = code; }
 }
@@ -274,7 +277,7 @@ function createOnlineFraWebSocketAdapter(options = {}) {
       }
       if (context.admitted) drain(context);
       schedule(context);
-    }, Math.min(config.admissionTimeoutMs, config.pingIntervalMs));
+    }, Math.min(config.admissionTimeoutMs, config.pingIntervalMs, SESSION_RECHECK_MS));
   }
   function refreshPeer(context) {
     const metadata = relayCall('connectionMetadata', context.connectionId);
@@ -287,12 +290,14 @@ function createOnlineFraWebSocketAdapter(options = {}) {
     return context.peerConnectionId !== null;
   }
   function drain(context) {
-    if (context.cleaned || !context.admitted || !isOpen(context.ws) || Number(context.ws.bufferedAmount || 0) > config.maxBufferedBytes) return;
+    if (context.cleaned || !context.admitted || !isOpen(context.ws)) return;
     try {
       // refreshPeer() keeps the machine link current for the metadata it
       // reports; its answer no longer gates delivery, because a web endpoint
       // has no machine-peer link and still has frames queued for it.
       refreshPeer(context);
+      // Revocation and expiry must still run when a receiver stops reading.
+      if (Number(context.ws.bufferedAmount || 0) > config.maxBufferedBytes) return;
       for (let count = 0; count < config.maxDrainPerTick && Number(context.ws.bufferedAmount || 0) <= config.maxBufferedBytes; count += 1) {
         const frame = relayCall('take', context.connectionId);
         if (frame === null || frame === undefined) return;
@@ -310,6 +315,7 @@ function createOnlineFraWebSocketAdapter(options = {}) {
          reported as what they are and the browser can say the true thing. */
       const code = typeof error === 'object' && error !== null ? error.relayCode : null;
       if (code === 'ONLINE_FRA_WEB_DISPLACED') { context.detail = code; return closeContext(context, 'displaced', CLOSE_DISPLACED); }
+      if (code === 'ONLINE_FRA_WEB_SESSION_REVOKED') { context.detail = code; return closeContext(context, 'session_revoked', 1008); }
       if (RELAY_ENDED_IT.has(code)) { context.detail = code; return closeContext(context, 'relay_ended_connection', 1000); }
       closeContext(context, 'relay_drain_failed', 1011);
     }

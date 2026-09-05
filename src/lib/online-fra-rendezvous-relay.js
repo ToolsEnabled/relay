@@ -218,7 +218,8 @@ function createOnlineFraRendezvousRelay(options = {}) {
   // dependency here (a promise is a refusal), consulted after the lease is
   // fully validated and before the nonce is durably consumed, so a refusal
   // costs nothing durable. Anything but `true` -- false, throw, a promise --
-  // refuses admission with its own named code.
+  // refuses admission with its own named code. The hosted browser authority
+  // is also consulted before ongoing delivery, without caching its decision.
   const admissionAuthority = options.admissionAuthority === undefined ? null : options.admissionAuthority;
   if (admissionAuthority !== null && typeof admissionAuthority !== 'function') fail('ONLINE_FRA_RELAY_OPTIONS_INVALID');
 
@@ -389,6 +390,9 @@ function createOnlineFraRendezvousRelay(options = {}) {
    * Bounded and evicted oldest-first: this is a hint for a socket that has not
    * noticed yet, not a record. The reasons are the same closed set of constants
    * the sink already receives, so nothing new is retained and no identifier is. */
+  // Queue buffers stay opaque. Their sending web endpoint is retained only
+  // while queued so withdrawing that endpoint also drops undelivered commands.
+  const queuedWebSources = new WeakMap();
   const closedReasons = new Map();
   const MAX_CLOSED_REASONS = 256;
   function rememberClosed(connectionId, reason) {
@@ -417,6 +421,17 @@ function createOnlineFraRendezvousRelay(options = {}) {
     }
     record.queue = [];
     record.queuedBytes = 0;
+    if (record.endpointRole === 'web-client') {
+      for (const receiver of connections.values()) {
+        receiver.queue = receiver.queue.filter(item => {
+          if (queuedWebSources.get(item) !== record) return true;
+          receiver.queuedBytes -= item.length;
+          decrement(deviceQueuedBytes, receiver.deviceId, item.length);
+          decrement(pairQueuedBytes, pairSlotKey(receiver), item.length);
+          return false;
+        });
+      }
+    }
     connections.delete(record.connectionId);
     decrement(deviceConnections, record.deviceId);
     // pairConnections is the MACHINE budget; the web slot never incremented it.
@@ -543,6 +558,31 @@ function createOnlineFraRendezvousRelay(options = {}) {
     }
   }
 
+  function endpointAuthorized(record) {
+    if (!admissionAuthority) return true;
+    try {
+      return admissionAuthority(Object.freeze({ pairId: record.pairId, deviceId: record.deviceId,
+        endpointRole: record.endpointRole, generation: record.generation })) === true;
+    } catch { return false; }
+  }
+
+  function currentWebEndpoint(record) {
+    if (record.closed) return false;
+    if (record.endpointRole !== 'web-client' || endpointAuthorized(record)) return true;
+    discard(record, 'ONLINE_FRA_WEB_SESSION_REVOKED');
+    return false;
+  }
+
+  function assertCurrentWeb(record) {
+    if (!currentWebEndpoint(record)) fail('ONLINE_FRA_WEB_SESSION_REVOKED');
+  }
+
+  function refreshWebSlot(record) {
+    if (record.endpointRole === 'web-client') return assertCurrentWeb(record);
+    const web = slots.get(pairSlotKey(record))?.get('web-client');
+    if (web) currentWebEndpoint(web);
+  }
+
   function connect({ identity, lease } = {}) {
     if (!enabled) fail('ONLINE_FRA_RELAY_DISABLED');
     const validated = validateLease(lease, identity);
@@ -558,28 +598,13 @@ function createOnlineFraRendezvousRelay(options = {}) {
     if ((deviceConnections.get(leaseValue.deviceId) || 0) >= maxConnectionsPerDevice
         || (!isWeb && (pairConnections.get(key) || 0) >= maxConnectionsPerPair)) fail('ONLINE_FRA_CONNECTION_CAPACITY_EXCEEDED');
     const pairSlots = slots.get(key) || new Map();
-    if (isWeb && pairSlots.has('web-client')) {
-      // DISPLACEMENT, not refusal: a new signed web lease is the account
-      // holder opening a newer tab or a different browser, and the account
-      // side already displaces web SESSIONS the same way. The old endpoint is
-      // closed with its own reason so the page can say what happened.
-      discard(pairSlots.get('web-client'), 'ONLINE_FRA_WEB_DISPLACED');
-    } else if (pairSlots.has(leaseValue.endpointRole)) fail('ONLINE_FRA_DUPLICATE_ENDPOINT_ROLE');
+    if (!isWeb && pairSlots.has(leaseValue.endpointRole)) fail('ONLINE_FRA_DUPLICATE_ENDPOINT_ROLE');
     // Consulted before admitLease on purpose: an authority refusal must not
     // consume the nonce, or a transient account-side outage would burn every
     // lease presented during it and the customer would need fresh leases for
     // no fault of their own. Sits after validateLease equally on purpose --
     // the authority only ever sees claims the signature already proved.
-    if (admissionAuthority) {
-      let authorized = false;
-      try {
-        authorized = admissionAuthority(Object.freeze({
-          pairId: pair.pairId, deviceId: leaseValue.deviceId,
-          endpointRole: leaseValue.endpointRole, generation
-        }));
-      } catch { authorized = false; }
-      if (authorized !== true) fail('ONLINE_FRA_PAIR_UNAUTHORIZED');
-    }
+    if (!endpointAuthorized(leaseValue)) fail('ONLINE_FRA_PAIR_UNAUTHORIZED');
     const id = connectionId();
     const admission = admitLease(leaseValue);
     if (admission === 'replayed') fail('ONLINE_FRA_LEASE_REPLAYED');
@@ -591,6 +616,11 @@ function createOnlineFraRendezvousRelay(options = {}) {
       endpointRole: leaseValue.endpointRole, generation, leaseId: leaseValue.leaseId,
       expiresAtMs: leaseValue.expiresAtMs
     });
+    // A refused or replayed lease must not displace the current browser.
+    // All admission checks finish before replacing its live slot.
+    if (isWeb && pairSlots.has('web-client')) {
+      discard(pairSlots.get('web-client'), 'ONLINE_FRA_WEB_DISPLACED');
+    }
     const record = {
       connectionId: id, pairId: pair.pairId, deviceId: leaseValue.deviceId,
       peerDeviceId: leaseValue.peerDeviceId, endpointRole: leaseValue.endpointRole,
@@ -629,6 +659,7 @@ function createOnlineFraRendezvousRelay(options = {}) {
     expireConnections(now());
     const record = recordFor(connectionId);
     assertPairActive(record);
+    refreshWebSlot(record);
     // EVERY LEG OF THIS PAIR, BY ROLE. The edge needs this to address a frame:
     // a machine talks to its peer machine AND to the pair's web slot over one
     // socket, and a browser talks to either machine. peerConnectionId stays
@@ -648,6 +679,7 @@ function createOnlineFraRendezvousRelay(options = {}) {
     const atMs = now();
     expireConnections(atMs);
     const source = recordFor(sourceId);
+    assertCurrentWeb(source);
     if (!Buffer.isBuffer(frame) || frame.length < 1 || frame.length > maxFrameBytes) fail('ONLINE_FRA_OPAQUE_FRAME_INVALID');
     if (typeof peerConnectionId !== 'string') fail('ONLINE_FRA_ROUTE_PEER_MISMATCH');
     const peer = recordFor(peerConnectionId);
@@ -666,6 +698,9 @@ function createOnlineFraRendezvousRelay(options = {}) {
       if (peer.pairId !== source.pairId || peer.generation !== source.generation) fail('ONLINE_FRA_ROUTE_PEER_MISMATCH');
     }
     assertPairActive(source);
+    // A machine's response to a withdrawn browser is discarded without
+    // disconnecting the machine or its other peer. Check before backpressure.
+    if (!currentWebEndpoint(peer)) return Object.freeze({ delivered: false, bytes: 0 });
     const key = pairSlotKey(peer);
     if (peer.queuedBytes + frame.length > maxQueuedBytesPerConnection
         || (deviceQueuedBytes.get(peer.deviceId) || 0) + frame.length > maxQueuedBytesPerDevice
@@ -688,7 +723,9 @@ function createOnlineFraRendezvousRelay(options = {}) {
     }
     // Copy only opaque bytes.  No parser, decoder, or crypto operation is
     // permitted in this module.
-    peer.queue.push(Buffer.from(frame));
+    const queued = Buffer.from(frame);
+    if (source.endpointRole === 'web-client') queuedWebSources.set(queued, source);
+    peer.queue.push(queued);
     peer.queuedBytes += frame.length;
     increment(deviceQueuedBytes, peer.deviceId, frame.length);
     increment(pairQueuedBytes, key, frame.length);
@@ -699,6 +736,7 @@ function createOnlineFraRendezvousRelay(options = {}) {
     expireConnections(now());
     const record = recordFor(connectionId);
     assertPairActive(record);
+    refreshWebSlot(record);
     const item = record.queue.shift();
     if (!item) return null;
     record.queuedBytes -= item.length;
