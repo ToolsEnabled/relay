@@ -260,7 +260,7 @@ function createOnlineFraSqliteLeaseState(options = {}) {
   function prepare(sql) { return unavailable(() => requireOpen().prepare(sql)); }
   function one(sql, ...values) { return unavailable(() => prepare(sql).get(...values)); }
   function run(sql, ...values) { return unavailable(() => prepare(sql).run(...values)); }
-  function transaction(fn) {
+  function transaction(fn, beforeCommit) {
     const db = requireOpen();
     unavailable(() => db.exec('BEGIN IMMEDIATE'));
     try {
@@ -268,6 +268,7 @@ function createOnlineFraSqliteLeaseState(options = {}) {
       const result = fn();
       attestSchema(db);
       assertSchemaIdentityStable(db, before);
+      if (beforeCommit) beforeCommit();
       unavailable(() => db.exec('COMMIT'));
       return result;
     } catch (error) {
@@ -495,6 +496,40 @@ function createOnlineFraSqliteLeaseState(options = {}) {
     });
   }
 
+  // Read only a bounded ordered page. The cursor stays with the service,
+  // never in general logs or an additional customer-identifier table.
+  function pairIds(input) {
+    exactKeys(input, ['afterPairId', 'limit'], 'ONLINE_FRA_SQLITE_REQUEST_INVALID');
+    const after = field(input, 'afterPairId', 'ONLINE_FRA_SQLITE_REQUEST_INVALID');
+    if (after !== null) identifier(after, 'ONLINE_FRA_SQLITE_REQUEST_INVALID');
+    const limit = safeInteger(field(input, 'limit', 'ONLINE_FRA_SQLITE_REQUEST_INVALID'), 'ONLINE_FRA_SQLITE_REQUEST_INVALID', 1, 16);
+    const db = requireOpen();
+    attestSchema(db);
+    const rows = unavailable(() => db.prepare('SELECT pair_id FROM fra_pair_state WHERE pair_id > ? ORDER BY pair_id LIMIT ?').all(after === null ? '' : after, limit));
+    return Object.freeze(rows.map(row => identifier(row.pair_id, 'ONLINE_FRA_SQLITE_SCHEMA_INVALID')));
+  }
+
+  // The service's read-only account authority must affirm retirement both
+  // before deletion and before this existing strict transaction commits.
+  // A missing/replaced/unreadable database or live pair rolls back all nonce
+  // and pair changes. This is not a cross-database account write transaction.
+  function deleteRetiredPair(input, retirementAuthority) {
+    exactKeys(input, ['pairId'], 'ONLINE_FRA_SQLITE_REQUEST_INVALID');
+    const pairId = identifier(field(input, 'pairId', 'ONLINE_FRA_SQLITE_REQUEST_INVALID'), 'ONLINE_FRA_SQLITE_REQUEST_INVALID');
+    if (typeof retirementAuthority !== 'function') fail('ONLINE_FRA_SQLITE_REQUEST_INVALID');
+    function confirm() {
+      let value;
+      try { value = retirementAuthority(); } catch { fail('ONLINE_FRA_SQLITE_RETIREMENT_UNCONFIRMED'); }
+      if (value !== true) fail('ONLINE_FRA_SQLITE_RETIREMENT_UNCONFIRMED');
+    }
+    return transaction(() => {
+      confirm();
+      run('DELETE FROM fra_lease_nonce WHERE pair_id = ?', pairId);
+      const result = run('DELETE FROM fra_pair_state WHERE pair_id = ?', pairId);
+      return relayReceipt(result.changes === 1 ? 'deleted' : 'absent');
+    }, confirm);
+  }
+
   function revokePair(input) {
     exactKeys(input, ['pairId', 'generation', 'reason'], 'ONLINE_FRA_SQLITE_REQUEST_INVALID');
     const pairId = identifier(field(input, 'pairId', 'ONLINE_FRA_SQLITE_REQUEST_INVALID'), 'ONLINE_FRA_SQLITE_REQUEST_INVALID');
@@ -560,6 +595,8 @@ function createOnlineFraSqliteLeaseState(options = {}) {
     pairState,
     revokePair,
     deletePair,
+    pairIds,
+    deleteRetiredPair,
     admitLease
   });
 }

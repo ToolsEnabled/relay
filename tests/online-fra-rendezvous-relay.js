@@ -502,7 +502,7 @@ function run() {
       const receipt = instance.registerPair(pairNew);
       equal(receipt.pairId, 'pair-ef', 'registration answers with the pair id');
       equal(receipt.pairCount, 2, 'the instance now carries both pairs');
-      ok(events.some(event => event.type === 'online_fra.pair.registered' && event.pairId === 'pair-ef'),
+      ok(events.some(event => event.type === 'online_fra.pair.registration_attempted' && event.pairId === 'pair-ef'),
         'registration is an audited event');
       const aLease = lease({ pair: pairNew, role: 'machine-a', overrides: { mtlsFingerprint: fingerprintC } });
       const bLease = lease({ pair: pairNew, role: 'machine-b', overrides: { mtlsFingerprint: fingerprintD } });
@@ -735,7 +735,7 @@ function run() {
       const receipt = instance.registerPair(pairSolo);
       equal(receipt.pairId, 'pair-solo');
       equal(receipt.pairCount, 2, 'a solo pair registers at runtime like any other');
-      ok(events.some(event => event.type === 'online_fra.pair.registered' && event.pairId === 'pair-solo'), 'and is audited the same way');
+      ok(events.some(event => event.type === 'online_fra.pair.registration_attempted' && event.pairId === 'pair-solo'), 'and is audited the same way');
     }
 
     // The key must be PRESENT and null. An absent key is still the old

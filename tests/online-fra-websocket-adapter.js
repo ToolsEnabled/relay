@@ -90,6 +90,16 @@ function upgrade(test, request = { method: 'GET', url: '/v1/rendezvous' }, ws = 
   { const idle = fixture(); idle.adapter.start(); const { ws } = upgrade(idle); ws.emit('message', Buffer.from('{"lease":1}'), false); idle.timers.advance(31); equal(ws.closed.at(-1), 1001); }
   { const frame = fixture(); frame.adapter.start(); const { ws } = upgrade(frame); ws.emit('message', Buffer.from('{"lease":1}'), false); ws.emit('message', Buffer.concat([Buffer.from([0x02]), Buffer.alloc(1024)]), true); equal(ws.closed.length, 1); }
   {
+    // Renewal refusal/challenge output shares the binary output budget. A
+    // client that stops reading cannot grow the send queue with control text.
+    const full = fixture(); full.adapter.start(); const { ws } = upgrade(full);
+    ws.emit('message', Buffer.from('{"lease":1}'), false);
+    ws.bufferedAmount = full.base.maxBufferedBytes + 1;
+    ws.emit('message', Buffer.from('{"renew":"request"}'), false);
+    equal(ws.closed.length, 1);
+    equal(ws.sent.length, 0, 'a full send queue cannot accumulate renewal refusals');
+  }
+  {
     let paired = false; const routes = [];
     const relay = {
       connect: () => ({ connectionId: 'connection-1' }),

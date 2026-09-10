@@ -26,6 +26,7 @@
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const http = require('node:http');
+const path = require('node:path');
 const { DatabaseSync } = require('node:sqlite');
 
 const { createOnlineFraRendezvousRelay } = require('./online-fra-rendezvous-relay');
@@ -45,6 +46,12 @@ const ASK_SQL = `SELECT rp.account_id AS accountId FROM relay_pairs rp
   LEFT JOIN devices b ON b.pair_id = rp.b_pair_id AND b.revoked_at_ms IS NULL
   WHERE rp.relay_pair_id = ? AND (rp.b_pair_id IS NULL OR b.pair_id IS NOT NULL)`;
 
+// The browser introduction is withdrawn by the account service on sign-out.
+// It lives in this same device database; no account/session database is opened.
+const WEB_SESSION_SQL = `SELECT 1 FROM relay_web_sessions
+  WHERE relay_pair_id = ? AND web_device_id = ? AND account_id = ? AND expires_at_ms > ?
+    AND COALESCE(authorization_expires_at_ms, expires_at_ms) > ?`;
+
 /* EVERY LIVE PAIR, FOR THE RECOVERY BELOW. The same joins the ASK authority
    makes, without the id filter: a pair is live when both its machines are
    still enrolled -- or, for a SOLO row (b_pair_id NULL), when its one machine
@@ -58,6 +65,20 @@ const LIVE_PAIRS_SQL = `SELECT rp.relay_pair_id AS pairId, rp.capability_digest 
   JOIN devices a ON a.pair_id = rp.a_pair_id AND a.revoked_at_ms IS NULL
   LEFT JOIN devices b ON b.pair_id = rp.b_pair_id AND b.revoked_at_ms IS NULL
   WHERE a.device_id IS NOT NULL AND (rp.b_pair_id IS NULL OR b.device_id IS NOT NULL)`;
+
+// Retirement needs an affirmative read, distinct from admission's boolean
+// refusal. A missing device or revoked half retires a pair; a digest/generation
+// conflict or missing device identity does not authorize deleting its history.
+const PAIR_AUTHORITY_SQL = `SELECT rp.relay_pair_id AS pairId, rp.account_id AS accountId,
+    rp.capability_digest AS capabilityDigest, rp.b_pair_id AS bPairId,
+    a.pair_id AS aExists, a.revoked_at_ms AS aRevoked, a.device_id AS machineAId,
+    b.pair_id AS bExists, b.revoked_at_ms AS bRevoked, b.device_id AS machineBId
+  FROM relay_pairs rp
+  LEFT JOIN devices a ON a.pair_id = rp.a_pair_id
+  LEFT JOIN devices b ON b.pair_id = rp.b_pair_id
+  WHERE rp.relay_pair_id = ?`;
+const RETIREMENT_BATCH_SIZE = 4;
+const RETIREMENT_INTERVAL_MS = 30_000;
 
 class OnlineFraRelayServiceError extends Error {
   constructor(code, message) {
@@ -109,17 +130,72 @@ function createOnlineFraRelayService(config = {}) {
 
   // --- the ASK authority: read-only, fail-closed ---------------------------
   let accountDb = null;
+  let accountFile = null;
+  let accountIdentity = null;
+  function accountPathIdentity() {
+    const full = path.resolve(accountDbPath);
+    let cursor = path.parse(full).root;
+    const identities = [];
+    for (const part of ['', ...full.slice(cursor.length).split(path.sep).filter(Boolean)]) {
+      if (part) cursor = path.join(cursor, part);
+      const st = fs.lstatSync(cursor, { bigint: true });
+      if (st.isSymbolicLink() || (cursor === full
+        ? !st.isFile() || st.nlink !== 1n : !st.isDirectory())) throw new Error('Account path is not ordinary');
+      identities.push(`${st.dev}:${st.ino}:${st.birthtimeNs}`);
+    }
+    return identities.join('/');
+  }
+  function accountIdentityMatches() {
+    if (!accountDb || accountFile === null || accountIdentity === null) return false;
+    const st = fs.fstatSync(accountFile, { bigint: true });
+    return st.isFile() && st.nlink === 1n
+      && `${st.dev}:${st.ino}:${st.birthtimeNs}` === accountIdentity.split('/').at(-1)
+      && accountPathIdentity() === accountIdentity;
+  }
   function openAccountDb() {
     // readOnly by construction: this process must never be able to take a
     // write lock on the account database (the ONE-PROCESS invariant is a
     // write-side property, and this keeps it provably untouched).
-    accountDb = new DatabaseSync(accountDbPath, { readOnly: true });
+    const identity = accountPathIdentity();
+    accountFile = fs.openSync(accountDbPath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+    try {
+      accountDb = new DatabaseSync(accountDbPath, { readOnly: true });
+      accountIdentity = identity;
+      if (!accountIdentityMatches()) throw new Error('Account database changed while opening');
+    } catch (error) {
+      if (accountDb) accountDb.close();
+      accountDb = null;
+      fs.closeSync(accountFile); accountFile = null; accountIdentity = null;
+      throw error;
+    }
+  }
+  function pairAuthority(pairId) {
+    try {
+      if (!accountIdentityMatches()) return { state: 'unknown' };
+      const row = accountDb.prepare(PAIR_AUTHORITY_SQL).get(pairId);
+      if (!accountIdentityMatches()) return { state: 'unknown' };
+      if (!row) return { state: 'retired' };
+      if (typeof row.accountId !== 'string' || row.accountId.length === 0) return { state: 'unknown' };
+      if (row.aExists === null || row.aRevoked !== null
+          || (row.bPairId !== null && (row.bExists === null || row.bRevoked !== null))) return { state: 'retired' };
+      return { state: 'live', row };
+    } catch { return { state: 'unknown' }; }
   }
   function admissionAuthority(request) {
     try {
-      if (!accountDb) return false;
+      if (!accountIdentityMatches()) return false;
       const row = accountDb.prepare(ASK_SQL).get(request.pairId);
-      return Boolean(row && typeof row.accountId === 'string' && row.accountId.length > 0);
+      if (!row || typeof row.accountId !== 'string' || row.accountId.length === 0) return false;
+      if (request.endpointRole === 'web-client') {
+        // Existing introductions finish their bounded lifetime during rollout;
+        // new rows carry the account session's earlier idle/absolute deadline.
+        // Missing schema or unreadable authority fails closed in this catch.
+        const nowMs = Date.now();
+        const live = Boolean(accountDb.prepare(WEB_SESSION_SQL).get(
+          request.pairId, request.deviceId, row.accountId, nowMs, nowMs));
+        return live && accountIdentityMatches();
+      }
+      return accountIdentityMatches();
     } catch {
       // Unreadable is a refusal, never a guess -- and never a crash: a
       // throwing authority would refuse with a stack instead of a code.
@@ -307,7 +383,10 @@ function createOnlineFraRelayService(config = {}) {
     maxQueuedBytesPerPair,
     eventSink,
     leaseState,
-    admissionAuthority
+    admissionAuthority,
+    // Recheck account pair/device liveness even if removal could not notify
+    // the relay's control channel. Browser logout leaves machine roles live.
+    connectionAuthority: admissionAuthority
   });
 
   // Admission outcomes come from wrapping connect() -- the event stream never
@@ -366,33 +445,11 @@ function createOnlineFraRelayService(config = {}) {
   // route and the privacy policy's "end to end" is this route being complete.
   const actions = {
     'register-pair': body => {
-      const initialized = leaseState.initializePair({
-        pairId: body.pairId, generation: body.generation, capabilityDigest: body.capabilityDigest
+      const receipt = registerCurrentPair({
+        pairId: body.pairId, machineAId: body.machineAId, machineBId: body.machineBId,
+        capabilityDigest: body.capabilityDigest, generation: body.generation
       });
-      if (initialized.outcome === 'conflict') return { ok: false, outcome: 'conflict' };
-      let receipt;
-      try {
-        receipt = relay.registerPair({
-          pairId: body.pairId, machineAId: body.machineAId,
-          machineBId: body.machineBId, capabilityDigest: body.capabilityDigest
-        });
-      } catch (error) {
-        /* ALREADY REGISTERED IS A SUCCESS, NOT A REFUSAL -- and since the boot
-           recovery below, it is the ordinary case rather than a strange one:
-           this service rebuilds its topology from the account database at
-           start, so a pair formed before a restart is already here the next
-           time the account service speaks about it. Answering 409 would make
-           the account service undo a person's connection over a retry it was
-           right to make.
-
-           Narrow on purpose. initializePair has already compared the
-           generation and the capability digest against the durable record and
-           answered `conflict` if either moved, so reaching this line means it
-           is the same pair. Every other failure still refuses. */
-        if (error.code !== 'ONLINE_FRA_RELAY_PAIR_INVALID') throw error;
-        return { ok: true, outcome: 'already-registered', pairCount: relay.snapshot().pairCount };
-      }
-      return { ok: true, outcome: 'registered', pairCount: receipt.pairCount };
+      return { ok: true, outcome: receipt.outcome, pairCount: receipt.pairCount };
     },
     'retire-pair': body => {
       relay.retirePair({ pairId: body.pairId });
@@ -410,6 +467,51 @@ function createOnlineFraRelayService(config = {}) {
     }
   };
 
+  function registerCurrentPair(input) {
+    // Preserve the existing malformed solo-request refusal before account
+    // authority lookup; an omitted B is distinct from an explicit null B.
+    if (input.machineBId === undefined) fail('ONLINE_FRA_RELAY_PAIR_INVALID');
+    const authority = pairAuthority(input.pairId);
+    if (authority.state === 'unknown') fail('RELAY_SERVICE_ACCOUNT_DB_UNAVAILABLE');
+    if (authority.state !== 'live' || authority.row.machineAId !== input.machineAId
+        || authority.row.machineBId !== input.machineBId
+        || authority.row.capabilityDigest !== input.capabilityDigest) fail('RELAY_SERVICE_PAIR_UNAUTHORIZED');
+    // No await between the current account tuple and existing synchronous
+    // topology/generation/capacity/durable-revocation checks.
+    return relay.ensurePair(input);
+  }
+
+  let retirementCursor = null;
+  let retirementTimer = null;
+  let retirementRunning = false;
+  let retirementLast = Object.freeze({ scanned: 0, deleted: 0, live: 0, deferred: 0, failed: 0 });
+  function reconcileRetiredPairs() {
+    if (retirementRunning) return retirementLast;
+    retirementRunning = true;
+    const result = { scanned: 0, deleted: 0, live: 0, deferred: 0, failed: 0 };
+    try {
+      const ids = leaseState.pairIds({ afterPairId: retirementCursor, limit: RETIREMENT_BATCH_SIZE });
+      if (ids.length === 0) retirementCursor = null;
+      for (const pairId of ids) {
+        // Advance even on failure; retained rows are revisited after wrapping,
+        // and restarting begins again at the first durable identifier.
+        retirementCursor = pairId;
+        result.scanned += 1;
+        const authority = pairAuthority(pairId);
+        if (authority.state === 'live') { result.live += 1; continue; }
+        if (authority.state !== 'retired') { result.deferred += 1; continue; }
+        try {
+          try { relay.retirePair({ pairId }); }
+          catch (error) { if (error.code !== 'ONLINE_FRA_RETIREMENT_INVALID') throw error; }
+          const removed = leaseState.deleteRetiredPair({ pairId }, () => pairAuthority(pairId).state === 'retired');
+          if (removed.outcome === 'deleted') result.deleted += 1;
+        } catch { result.failed += 1; }
+      }
+    } catch { result.failed += 1; }
+    finally { retirementRunning = false; retirementLast = Object.freeze(result); }
+    return retirementLast;
+  }
+
   let controlServer = null;
 
   function handleControl(request, response) {
@@ -423,6 +525,7 @@ function createOnlineFraRelayService(config = {}) {
         ok: true,
         relay: relay.snapshot(),
         events: metadataSink.snapshot(),
+        retirement: retirementLast,
         reporting: {
           configured: Boolean(report),
           queued: reportQueue.length,
@@ -475,7 +578,11 @@ function createOnlineFraRelayService(config = {}) {
     const outcome = { recovered: 0, conflicts: 0, skipped: 0, readable: false };
     if (!accountDb) return outcome;
     let rows;
-    try { rows = accountDb.prepare(LIVE_PAIRS_SQL).all(); } catch { return outcome; }
+    try {
+      if (!accountIdentityMatches()) return outcome;
+      rows = accountDb.prepare(LIVE_PAIRS_SQL).all();
+      if (!accountIdentityMatches()) return outcome;
+    } catch { return outcome; }
     outcome.readable = true;
     /* Taken from the relay rather than from config, so the durable lease state
        is initialised with exactly the generation the relay will later compare a
@@ -484,16 +591,15 @@ function createOnlineFraRelayService(config = {}) {
     const relayGeneration = relay.snapshot().generation;
     for (const row of rows) {
       try {
-        const initialized = leaseState.initializePair({
-          pairId: row.pairId, generation: relayGeneration, capabilityDigest: row.capabilityDigest,
-        });
-        if (initialized.outcome === 'conflict') { outcome.conflicts += 1; continue; }
-        relay.registerPair({
-          pairId: row.pairId, machineAId: row.machineAId,
-          machineBId: row.machineBId, capabilityDigest: row.capabilityDigest,
+        registerCurrentPair({
+          pairId: row.pairId, machineAId: row.machineAId, machineBId: row.machineBId,
+          capabilityDigest: row.capabilityDigest, generation: relayGeneration
         });
         outcome.recovered += 1;
-      } catch { outcome.skipped += 1; }
+      } catch (error) {
+        if (error.code === 'ONLINE_FRA_RELAY_PAIR_CONFLICT') outcome.conflicts += 1;
+        else outcome.skipped += 1;
+      }
     }
     return outcome;
   }
@@ -502,6 +608,9 @@ function createOnlineFraRelayService(config = {}) {
     openAccountDb();
     leaseState.open();
     const recovery = recoverPairs();
+    reconcileRetiredPairs();
+    retirementTimer = setInterval(reconcileRetiredPairs, RETIREMENT_INTERVAL_MS);
+    if (retirementTimer.unref) retirementTimer.unref();
     if (report) {
       reportTimer = setInterval(() => { flushReports(); }, Number.isInteger(report.flushMs) ? report.flushMs : 30_000);
       if (reportTimer.unref) reportTimer.unref();
@@ -514,18 +623,21 @@ function createOnlineFraRelayService(config = {}) {
   }
 
   async function stop() {
+    if (retirementTimer) { clearInterval(retirementTimer); retirementTimer = null; }
     if (reportTimer) { clearInterval(reportTimer); reportTimer = null; }
     await flushReports(); // best effort; a dead account box costs the batch, nothing else
     const closing = controlServer
       ? new Promise(resolve => controlServer.close(() => resolve())) : Promise.resolve();
     controlServer = null;
     if (accountDb) { try { accountDb.close(); } catch { /* already closed */ } accountDb = null; }
+    if (accountFile !== null) { fs.closeSync(accountFile); accountFile = null; accountIdentity = null; }
     try { leaseState.close(); } catch { /* already closed */ }
     return closing;
   }
 
   return Object.freeze({
     start, stop, relay: servedRelay, leaseState, metadataSink, admissionAuthority,
+    reconcileRetiredPairs,
     // Test seams for the reporting channel; harmless to expose, and proving
     // fail-open needs to see the queue bound from outside.
     flushReports,

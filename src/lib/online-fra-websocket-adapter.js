@@ -33,6 +33,7 @@ const LEG_ROLE = Object.freeze({ 0x01: 'machine-a', 0x02: 'machine-b', 0x03: 'we
    reads it and says so; without a code of its own this arrived as a generic
    internal error and the page could only guess. */
 const CLOSE_DISPLACED = 4001;
+const MIN_RENEWAL_INTERVAL_MS = 1000;
 /* Reasons the relay closes a connection deliberately. Each is a normal end to a
    connection, not a fault of this edge, and each closes 1000 rather than 1011 so
    an operator counting internal errors is counting real ones. */
@@ -64,6 +65,10 @@ const DEFAULTS = Object.freeze({
      embedders that pass nothing behave exactly as they did. */
   log: () => {}
 });
+
+// Recheck admitted authority even when no frames arrive or a socket is full.
+const SESSION_RECHECK_MS = 1_000;
+const MAX_RATE_ENTRIES = 8192;
 
 class OnlineFraWebSocketAdapterError extends Error {
   constructor(code) { super(code); this.name = 'OnlineFraWebSocketAdapterError'; this.code = code; }
@@ -120,6 +125,7 @@ function createOnlineFraWebSocketAdapter(options = {}) {
   let wss = null;
   const live = new Set();
   const rate = new Map();
+  let nextRateSweepAt = 0;
 
   function emit(type, metadata = {}) {
     const event = Object.freeze({ type, atMs: Math.floor(config.clock()), ...metadata });
@@ -185,7 +191,17 @@ function createOnlineFraWebSocketAdapter(options = {}) {
   }
   function admissionSlot(ip) {
     const now = config.clock();
+    // An unauthenticated socket may close before its IP window ends. Reclaim
+    // those inactive windows, and bound retained distinct addresses without
+    // evicting unexpired limits. Sweep at most once per second under churn.
+    if (now >= nextRateSweepAt) {
+      for (const [address, entry] of rate) {
+        if (entry.active === 0 && now - entry.windowStart >= config.admissionWindowMs) rate.delete(address);
+      }
+      nextRateSweepAt = now + Math.min(config.admissionWindowMs, 1000);
+    }
     let state = rate.get(ip);
+    if (!state && rate.size >= MAX_RATE_ENTRIES) return null;
     if (!state || now - state.windowStart >= config.admissionWindowMs) state = { windowStart: now, admissions: 0, active: state ? state.active : 0 };
     if (state.admissions >= config.maxAdmissionsPerIp || state.active >= config.maxSocketsPerIp) return null;
     state.admissions += 1;
@@ -227,6 +243,8 @@ function createOnlineFraWebSocketAdapter(options = {}) {
   function closeContext(context, reason, code = 1008, socketAlreadyClosed = false) {
     if (!context || context.cleaned) return;
     context.cleaned = true;
+    forgetChallenge(context, 'challengeNonce');
+    forgetChallenge(context, 'renewalNonce');
     if (context.timer !== null) config.clearTimer(context.timer);
     live.delete(context);
     releaseSlot(context.attestation.ip);
@@ -274,7 +292,7 @@ function createOnlineFraWebSocketAdapter(options = {}) {
       }
       if (context.admitted) drain(context);
       schedule(context);
-    }, Math.min(config.admissionTimeoutMs, config.pingIntervalMs));
+    }, Math.min(config.admissionTimeoutMs, config.pingIntervalMs, SESSION_RECHECK_MS));
   }
   function refreshPeer(context) {
     const metadata = relayCall('connectionMetadata', context.connectionId);
@@ -287,12 +305,14 @@ function createOnlineFraWebSocketAdapter(options = {}) {
     return context.peerConnectionId !== null;
   }
   function drain(context) {
-    if (context.cleaned || !context.admitted || !isOpen(context.ws) || Number(context.ws.bufferedAmount || 0) > config.maxBufferedBytes) return;
+    if (context.cleaned || !context.admitted || !isOpen(context.ws)) return;
     try {
       // refreshPeer() keeps the machine link current for the metadata it
       // reports; its answer no longer gates delivery, because a web endpoint
       // has no machine-peer link and still has frames queued for it.
       refreshPeer(context);
+      // Revocation and expiry must still run when a receiver stops reading.
+      if (Number(context.ws.bufferedAmount || 0) > config.maxBufferedBytes) return;
       for (let count = 0; count < config.maxDrainPerTick && Number(context.ws.bufferedAmount || 0) <= config.maxBufferedBytes; count += 1) {
         const frame = relayCall('take', context.connectionId);
         if (frame === null || frame === undefined) return;
@@ -310,6 +330,8 @@ function createOnlineFraWebSocketAdapter(options = {}) {
          reported as what they are and the browser can say the true thing. */
       const code = typeof error === 'object' && error !== null ? error.relayCode : null;
       if (code === 'ONLINE_FRA_WEB_DISPLACED') { context.detail = code; return closeContext(context, 'displaced', CLOSE_DISPLACED); }
+      if (code === 'ONLINE_FRA_WEB_SESSION_REVOKED') { context.detail = code; return closeContext(context, 'session_revoked', 1008); }
+      if (code === 'ONLINE_FRA_CONNECTION_UNAUTHORIZED') { context.detail = code; return closeContext(context, 'authorization_revoked', 1008); }
       if (RELAY_ENDED_IT.has(code)) { context.detail = code; return closeContext(context, 'relay_ended_connection', 1000); }
       closeContext(context, 'relay_drain_failed', 1011);
     }
@@ -342,6 +364,80 @@ function createOnlineFraWebSocketAdapter(options = {}) {
        removes it from the set being iterated. */
     if (target) drain(target);
   }
+  function forgetChallenge(context, field) {
+    const nonce = context[field];
+    context[field] = null;
+    if (nonce && config.keyAdmission && typeof config.keyAdmission.cancelChallenge === 'function') {
+      try { config.keyAdmission.cancelChallenge(nonce); } catch {}
+    }
+  }
+
+  // Renewal control frames never enter the opaque routing queues. Possession
+  // must be proved again against a fresh challenge on this socket; the core
+  // then validates a new signed lease for the very same endpoint. Refusal
+  // leaves the old lease's deadline intact, including during account outages.
+  function renew(context, data) {
+    if (!Buffer.isBuffer(data) || data.length < 1 || data.length > config.maxAdmissionBytes
+        || Number(context.ws.bufferedAmount || 0) > config.maxBufferedBytes) fail('ONLINE_FRA_WS_RENEWAL_INVALID');
+    let parsed;
+    try { parsed = JSON.parse(data.toString('utf8')); } catch { fail('ONLINE_FRA_WS_RENEWAL_INVALID'); }
+    if (!plain(parsed) || !Object.hasOwn(parsed, 'renew')) fail('ONLINE_FRA_WS_RENEWAL_INVALID');
+    const refuse = code => {
+      context.ws.send(JSON.stringify({ renewalRefused: { code } }));
+      // Revocation/expiry may have closed the core while refusing this lease.
+      // Carry that closure through to the socket before accepting more data.
+      drain(context);
+    };
+    if (context.attestation.mode !== 'key' || typeof config.keyAdmission?.renew !== 'function') {
+      return refuse('ONLINE_FRA_WS_RENEWAL_UNSUPPORTED');
+    }
+    if (parsed.renew === 'request') {
+      if (Object.keys(parsed).length !== 1) fail('ONLINE_FRA_WS_RENEWAL_INVALID');
+      const atMs = config.clock();
+      if (context.renewalNonce && atMs < context.renewalDeadline) return refuse('ONLINE_FRA_WS_RENEWAL_BUSY');
+      forgetChallenge(context, 'renewalNonce');
+      if (context.lastRenewalRequestAtMs !== null && atMs - context.lastRenewalRequestAtMs < MIN_RENEWAL_INTERVAL_MS) {
+        return refuse('ONLINE_FRA_WS_RENEWAL_THROTTLED');
+      }
+      // No challenge for an endpoint that has expired or been withdrawn.
+      relayCall('connectionMetadata', context.connectionId);
+      context.lastRenewalRequestAtMs = atMs;
+      const issued = sync(config.keyAdmission.challenge({ connectionId: context.connectionId }), 'ONLINE_FRA_WS_RELAY_ASYNC');
+      if (!plain(issued) || typeof issued.nonce !== 'string' || issued.nonce.length < 16
+          || !Number.isSafeInteger(issued.expiresAtMs) || issued.expiresAtMs <= atMs) fail('ONLINE_FRA_WS_RENEWAL_INVALID');
+      context.renewalNonce = issued.nonce;
+      context.renewalDeadline = Math.min(issued.expiresAtMs, atMs + config.admissionTimeoutMs);
+      context.ws.send(JSON.stringify({ challenge: issued.nonce, expiresAtMs: context.renewalDeadline, renewal: true }));
+      return;
+    }
+    const keys = ['renew', 'publicKeySpki', 'nonce', 'signature'];
+    if (Object.keys(parsed).length !== keys.length || keys.some(key => !Object.hasOwn(parsed, key))
+        || !plain(parsed.renew)) fail('ONLINE_FRA_WS_RENEWAL_INVALID');
+    if (typeof parsed.nonce !== 'string' || !context.renewalNonce || parsed.nonce !== context.renewalNonce) {
+      return refuse('ONLINE_FRA_WS_RENEWAL_NONCE_MISMATCH');
+    }
+    if (config.clock() >= context.renewalDeadline) {
+      forgetChallenge(context, 'renewalNonce');
+      return refuse('ONLINE_FRA_WS_RENEWAL_EXPIRED');
+    }
+    let renewed;
+    try {
+      renewed = sync(config.keyAdmission.renew({ connectionId: context.connectionId,
+        lease: parsed.renew, browserPublicKeySpki: parsed.publicKeySpki,
+        nonce: parsed.nonce, signature: parsed.signature }), 'ONLINE_FRA_WS_RELAY_ASYNC');
+    } catch (error) {
+      const code = typeof error?.code === 'string' && /^ONLINE_FRA_[A-Z0-9_]{1,48}$/.test(error.code)
+        ? error.code : 'ONLINE_FRA_WS_RENEWAL_REFUSED';
+      return refuse(code);
+    } finally {
+      forgetChallenge(context, 'renewalNonce');
+    }
+    if (!plain(renewed) || typeof renewed.leaseId !== 'string' || !SAFE_ID.test(renewed.leaseId)
+        || !Number.isSafeInteger(renewed.expiresAtMs) || renewed.expiresAtMs <= config.clock()) fail('ONLINE_FRA_WS_RENEWAL_INVALID');
+    context.ws.send(JSON.stringify({ renewed: { leaseId: renewed.leaseId, expiresAtMs: renewed.expiresAtMs } }));
+    drain(context);
+  }
+
   function admit(context, data, binary) {
     if (binary || !Buffer.isBuffer(data) || data.length < 1 || data.length > config.maxAdmissionBytes) fail('ONLINE_FRA_WS_ADMISSION_INVALID');
     let parsed;
@@ -380,6 +476,7 @@ function createOnlineFraWebSocketAdapter(options = {}) {
     }
 
     context.connectionId = connected.connectionId;
+    forgetChallenge(context, 'challengeNonce');
     refreshPeer(context);
     // THE ROLE COMES FROM THE RELAY (refreshPeer reads it off the metadata the
     // relay reports for the connection it just admitted); the lease in hand is
@@ -398,6 +495,7 @@ function createOnlineFraWebSocketAdapter(options = {}) {
     try {
       context.lastActivity = config.clock();
       if (!context.admitted) return admit(context, data, binary);
+      if (!binary) return renew(context, data);
       if (!binary || !Buffer.isBuffer(data) || data.length < 2 || data.length > config.maxFrameBytes
         || Number(context.ws.bufferedAmount || 0) > config.maxBufferedBytes) fail('ONLINE_FRA_WS_FRAME_INVALID');
       // The leg byte is the address. Resolve it against the pair's live legs
@@ -443,13 +541,19 @@ function createOnlineFraWebSocketAdapter(options = {}) {
       drain(context);
       deliverTo(targetId);
     } catch (error) {
+      // An independently authorized sender survives a destination's account
+      // revocation between routing lookups; the revoked source still closes.
+      if (context.admitted && error && error.relayCode === 'ONLINE_FRA_CONNECTION_UNAUTHORIZED') {
+        try { relayCall('connectionMetadata', context.connectionId); return; } catch {}
+      }
       if (error instanceof OnlineFraWebSocketAdapterError && !context.detail) context.detail = error.code;
       closeContext(context, context.admitted ? 'frame_invalid' : 'admission_failed');
     }
   }
   function attach(ws, attestation) {
     const context = { ws, attestation, meta: metadataFingerprint(attestation), timer: null, cleaned: false, admitted: false,
-      relayClosed: false, challengeNonce: null, role: null, detail: null,
+      relayClosed: false, challengeNonce: null, renewalNonce: null, renewalDeadline: null,
+      lastRenewalRequestAtMs: null, role: null, detail: null,
       connectionId: null, peerConnectionId: null, admissionDeadline: config.clock() + config.admissionTimeoutMs,
       lastActivity: config.clock(), lastPing: config.clock() };
     live.add(context);
@@ -502,6 +606,7 @@ function createOnlineFraWebSocketAdapter(options = {}) {
       try { if (wss && typeof wss.close === 'function') wss.close(); } catch {}
       wss = null;
       rate.clear();
+      nextRateSweepAt = 0;
       started = false;
       return true;
     },

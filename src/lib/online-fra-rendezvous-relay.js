@@ -218,9 +218,14 @@ function createOnlineFraRendezvousRelay(options = {}) {
   // dependency here (a promise is a refusal), consulted after the lease is
   // fully validated and before the nonce is durably consumed, so a refusal
   // costs nothing durable. Anything but `true` -- false, throw, a promise --
-  // refuses admission with its own named code.
+  // refuses admission with its own named code. The hosted browser authority
+  // is also consulted before ongoing delivery, without caching its decision.
   const admissionAuthority = options.admissionAuthority === undefined ? null : options.admissionAuthority;
   if (admissionAuthority !== null && typeof admissionAuthority !== 'function') fail('ONLINE_FRA_RELAY_OPTIONS_INVALID');
+  // The hosted account authority can also withdraw a machine's enrollment
+  // while its transport lease is live, even if control-channel cleanup fails.
+  const connectionAuthority = options.connectionAuthority === undefined ? null : options.connectionAuthority;
+  if (connectionAuthority !== null && typeof connectionAuthority !== 'function') fail('ONLINE_FRA_RELAY_OPTIONS_INVALID');
 
   // FAIR USE, LAYER 1: a token bucket per pair. ABSENT BY DEFAULT -- a
   // self-hosted relay is unmetered, and metering it is a hosted-deployment
@@ -275,6 +280,10 @@ function createOnlineFraRendezvousRelay(options = {}) {
   const deviceQueuedBytes = new Map();
   const pairQueuedBytes = new Map();
   let eventSequence = 0;
+  // Successful runtime topology publications since this instance was created.
+  // Keep this bounded counter local: a callback after SQLite commits could
+  // throw or re-enter the core after authority has already been published.
+  let completedRegistrations = 0;
 
   function now() {
     const value = clock();
@@ -389,6 +398,9 @@ function createOnlineFraRendezvousRelay(options = {}) {
    * Bounded and evicted oldest-first: this is a hint for a socket that has not
    * noticed yet, not a record. The reasons are the same closed set of constants
    * the sink already receives, so nothing new is retained and no identifier is. */
+  // Queue buffers stay opaque. Their sending web endpoint is retained only
+  // while queued so withdrawing that endpoint also drops undelivered commands.
+  const queuedWebSources = new WeakMap();
   const closedReasons = new Map();
   const MAX_CLOSED_REASONS = 256;
   function rememberClosed(connectionId, reason) {
@@ -417,6 +429,17 @@ function createOnlineFraRendezvousRelay(options = {}) {
     }
     record.queue = [];
     record.queuedBytes = 0;
+    if (record.endpointRole === 'web-client') {
+      for (const receiver of connections.values()) {
+        receiver.queue = receiver.queue.filter(item => {
+          if (queuedWebSources.get(item) !== record) return true;
+          receiver.queuedBytes -= item.length;
+          decrement(deviceQueuedBytes, receiver.deviceId, item.length);
+          decrement(pairQueuedBytes, pairSlotKey(receiver), item.length);
+          return false;
+        });
+      }
+    }
     connections.delete(record.connectionId);
     decrement(deviceConnections, record.deviceId);
     // pairConnections is the MACHINE budget; the web slot never incremented it.
@@ -541,6 +564,41 @@ function createOnlineFraRendezvousRelay(options = {}) {
       closePair(record.pairId, record.generation, 'ONLINE_FRA_PAIR_REVOKED', false);
       fail('ONLINE_FRA_PAIR_REVOKED');
     }
+    if (record.endpointRole !== 'web-client' && connectionAuthority
+        && !endpointAuthorized(record, connectionAuthority)) {
+      discard(record, 'ONLINE_FRA_CONNECTION_UNAUTHORIZED');
+      fail('ONLINE_FRA_CONNECTION_UNAUTHORIZED');
+    }
+  }
+
+  function endpointAuthorized(record, authority = admissionAuthority) {
+    if (!authority) return true;
+    try {
+      const answer = authority(Object.freeze({ pairId: record.pairId, deviceId: record.deviceId,
+        endpointRole: record.endpointRole, generation: record.generation }));
+      if (answer && typeof answer.then === 'function') {
+        Promise.resolve(answer).catch(() => {});
+        return false;
+      }
+      return answer === true;
+    } catch { return false; }
+  }
+
+  function currentWebEndpoint(record) {
+    if (record.closed) return false;
+    if (record.endpointRole !== 'web-client' || endpointAuthorized(record, connectionAuthority || admissionAuthority)) return true;
+    discard(record, 'ONLINE_FRA_WEB_SESSION_REVOKED');
+    return false;
+  }
+
+  function assertCurrentWeb(record) {
+    if (!currentWebEndpoint(record)) fail('ONLINE_FRA_WEB_SESSION_REVOKED');
+  }
+
+  function refreshWebSlot(record) {
+    if (record.endpointRole === 'web-client') return assertCurrentWeb(record);
+    const web = slots.get(pairSlotKey(record))?.get('web-client');
+    if (web) currentWebEndpoint(web);
   }
 
   function connect({ identity, lease } = {}) {
@@ -558,28 +616,13 @@ function createOnlineFraRendezvousRelay(options = {}) {
     if ((deviceConnections.get(leaseValue.deviceId) || 0) >= maxConnectionsPerDevice
         || (!isWeb && (pairConnections.get(key) || 0) >= maxConnectionsPerPair)) fail('ONLINE_FRA_CONNECTION_CAPACITY_EXCEEDED');
     const pairSlots = slots.get(key) || new Map();
-    if (isWeb && pairSlots.has('web-client')) {
-      // DISPLACEMENT, not refusal: a new signed web lease is the account
-      // holder opening a newer tab or a different browser, and the account
-      // side already displaces web SESSIONS the same way. The old endpoint is
-      // closed with its own reason so the page can say what happened.
-      discard(pairSlots.get('web-client'), 'ONLINE_FRA_WEB_DISPLACED');
-    } else if (pairSlots.has(leaseValue.endpointRole)) fail('ONLINE_FRA_DUPLICATE_ENDPOINT_ROLE');
+    if (!isWeb && pairSlots.has(leaseValue.endpointRole)) fail('ONLINE_FRA_DUPLICATE_ENDPOINT_ROLE');
     // Consulted before admitLease on purpose: an authority refusal must not
     // consume the nonce, or a transient account-side outage would burn every
     // lease presented during it and the customer would need fresh leases for
     // no fault of their own. Sits after validateLease equally on purpose --
     // the authority only ever sees claims the signature already proved.
-    if (admissionAuthority) {
-      let authorized = false;
-      try {
-        authorized = admissionAuthority(Object.freeze({
-          pairId: pair.pairId, deviceId: leaseValue.deviceId,
-          endpointRole: leaseValue.endpointRole, generation
-        }));
-      } catch { authorized = false; }
-      if (authorized !== true) fail('ONLINE_FRA_PAIR_UNAUTHORIZED');
-    }
+    if (!endpointAuthorized(leaseValue)) fail('ONLINE_FRA_PAIR_UNAUTHORIZED');
     const id = connectionId();
     const admission = admitLease(leaseValue);
     if (admission === 'replayed') fail('ONLINE_FRA_LEASE_REPLAYED');
@@ -591,10 +634,16 @@ function createOnlineFraRendezvousRelay(options = {}) {
       endpointRole: leaseValue.endpointRole, generation, leaseId: leaseValue.leaseId,
       expiresAtMs: leaseValue.expiresAtMs
     });
+    // A refused or replayed lease must not displace the current browser.
+    // All admission checks finish before replacing its live slot.
+    if (isWeb && pairSlots.has('web-client')) {
+      discard(pairSlots.get('web-client'), 'ONLINE_FRA_WEB_DISPLACED');
+    }
     const record = {
       connectionId: id, pairId: pair.pairId, deviceId: leaseValue.deviceId,
       peerDeviceId: leaseValue.peerDeviceId, endpointRole: leaseValue.endpointRole,
       generation, leaseId: leaseValue.leaseId, nonce: leaseValue.nonce,
+      mtlsFingerprint: leaseValue.mtlsFingerprint, issuedAtMs: leaseValue.issuedAtMs,
       expiresAtMs: leaseValue.expiresAtMs, queuedBytes: 0, queue: [],
       peerConnectionId: null, closed: false
     };
@@ -625,10 +674,71 @@ function createOnlineFraRendezvousRelay(options = {}) {
     return Object.freeze({ connectionId: id, pairId: record.pairId, deviceId: record.deviceId, endpointRole: record.endpointRole, generation, paired: Boolean(record.peerConnectionId) });
   }
 
+  // Renew the admitted endpoint, without replacing its slot, queues or peer
+  // links. A fresh proof supplies identity; every signed lease and account
+  // authority check still applies, and SQLite consumes its nonce before the
+  // expiry moves. An expired connection cannot be revived by this operation.
+  function renew({ connectionId, identity, lease } = {}) {
+    if (!enabled) fail('ONLINE_FRA_RELAY_DISABLED');
+    expireConnections(now());
+    const record = recordFor(connectionId);
+    assertPairActive(record);
+    assertCurrentWeb(record);
+    const { lease: fresh } = validateLease(lease, identity);
+    for (const field of ['pairId', 'deviceId', 'peerDeviceId', 'endpointRole', 'generation', 'mtlsFingerprint']) {
+      if (fresh[field] !== record[field]) fail('ONLINE_FRA_RENEWAL_IDENTITY_MISMATCH');
+    }
+    if (fresh.leaseId === record.leaseId || fresh.nonce === record.nonce
+        || fresh.issuedAtMs < record.issuedAtMs || fresh.expiresAtMs <= record.expiresAtMs) {
+      fail('ONLINE_FRA_RENEWAL_LEASE_STALE');
+    }
+    if (!endpointAuthorized(fresh)) fail('ONLINE_FRA_PAIR_UNAUTHORIZED');
+    let admission;
+    try { admission = admitLease(fresh); }
+    catch (error) {
+      closePair(record.pairId, record.generation, 'ONLINE_FRA_LEASE_STATE_UNAVAILABLE', false);
+      throw error;
+    }
+    if (admission === 'replayed') fail('ONLINE_FRA_LEASE_REPLAYED');
+    if (admission === 'revoked') {
+      closePair(record.pairId, record.generation, 'ONLINE_FRA_PAIR_REVOKED', false);
+      fail('ONLINE_FRA_PAIR_REVOKED');
+    }
+    try {
+      sink('online_fra.connection.renewed', {
+        connectionId, pairId: record.pairId, deviceId: record.deviceId,
+        endpointRole: record.endpointRole, generation: record.generation,
+        leaseId: fresh.leaseId, expiresAtMs: fresh.expiresAtMs
+      });
+    } catch (error) {
+      closePair(record.pairId, record.generation, 'ONLINE_FRA_EVENT_SINK_FAILED', false);
+      throw error;
+    }
+    // Trusted synchronous adapters may still take time or withdraw authority
+    // while the durable write/event is in progress. Check again before the
+    // commit; even a previously verified renewal cannot resurrect that slot.
+    assertPairActive(record);
+    assertCurrentWeb(record);
+    expireConnections(now());
+    recordFor(connectionId);
+    const commitAtMs = now();
+    if (record.expiresAtMs <= commitAtMs) {
+      discard(record, 'ONLINE_FRA_LEASE_EXPIRED');
+      fail('ONLINE_FRA_LEASE_EXPIRED');
+    }
+    if (fresh.expiresAtMs <= commitAtMs) fail('ONLINE_FRA_LEASE_TIME_INVALID');
+    record.leaseId = fresh.leaseId;
+    record.nonce = fresh.nonce;
+    record.issuedAtMs = fresh.issuedAtMs;
+    record.expiresAtMs = fresh.expiresAtMs;
+    return Object.freeze({ leaseId: record.leaseId, expiresAtMs: record.expiresAtMs });
+  }
+
   function connectionMetadata(connectionId) {
     expireConnections(now());
     const record = recordFor(connectionId);
     assertPairActive(record);
+    refreshWebSlot(record);
     // EVERY LEG OF THIS PAIR, BY ROLE. The edge needs this to address a frame:
     // a machine talks to its peer machine AND to the pair's web slot over one
     // socket, and a browser talks to either machine. peerConnectionId stays
@@ -648,6 +758,7 @@ function createOnlineFraRendezvousRelay(options = {}) {
     const atMs = now();
     expireConnections(atMs);
     const source = recordFor(sourceId);
+    assertCurrentWeb(source);
     if (!Buffer.isBuffer(frame) || frame.length < 1 || frame.length > maxFrameBytes) fail('ONLINE_FRA_OPAQUE_FRAME_INVALID');
     if (typeof peerConnectionId !== 'string') fail('ONLINE_FRA_ROUTE_PEER_MISMATCH');
     const peer = recordFor(peerConnectionId);
@@ -666,6 +777,10 @@ function createOnlineFraRendezvousRelay(options = {}) {
       if (peer.pairId !== source.pairId || peer.generation !== source.generation) fail('ONLINE_FRA_ROUTE_PEER_MISMATCH');
     }
     assertPairActive(source);
+    assertPairActive(peer);
+    // A machine's response to a withdrawn browser is discarded without
+    // disconnecting the machine or its other peer. Check before backpressure.
+    if (!currentWebEndpoint(peer)) return Object.freeze({ delivered: false, bytes: 0 });
     const key = pairSlotKey(peer);
     if (peer.queuedBytes + frame.length > maxQueuedBytesPerConnection
         || (deviceQueuedBytes.get(peer.deviceId) || 0) + frame.length > maxQueuedBytesPerDevice
@@ -688,7 +803,9 @@ function createOnlineFraRendezvousRelay(options = {}) {
     }
     // Copy only opaque bytes.  No parser, decoder, or crypto operation is
     // permitted in this module.
-    peer.queue.push(Buffer.from(frame));
+    const queued = Buffer.from(frame);
+    if (source.endpointRole === 'web-client') queuedWebSources.set(queued, source);
+    peer.queue.push(queued);
     peer.queuedBytes += frame.length;
     increment(deviceQueuedBytes, peer.deviceId, frame.length);
     increment(pairQueuedBytes, key, frame.length);
@@ -699,6 +816,7 @@ function createOnlineFraRendezvousRelay(options = {}) {
     expireConnections(now());
     const record = recordFor(connectionId);
     assertPairActive(record);
+    refreshWebSlot(record);
     const item = record.queue.shift();
     if (!item) return null;
     record.queuedBytes -= item.length;
@@ -754,19 +872,75 @@ function createOnlineFraRendezvousRelay(options = {}) {
   //
   // Same validation as construction, one atom at a time: exact keys, the
   // identifier grammar, device ids globally unique across ALL pairs on the
-  // instance, the cap. The event goes to the sink BEFORE the map mutates, so
+  // instance, the cap. The attempt goes to the sink BEFORE the map mutates, so
   // an unauditable registration never becomes an admissible one -- the same
   // ordering connect() uses for the same reason.
-  function registerPair(input) {
+  function planRegistration(input, allowExisting) {
+    const pair = normalizedPair(input, new Set());
+    const current = pairs.get(pair.pairId);
+    if (current) {
+      if (allowExisting && current.machineAId === pair.machineAId
+          && current.machineBId === pair.machineBId && current.capabilityDigest === pair.capabilityDigest) {
+        return { pair: current, existing: true };
+      }
+      fail(allowExisting ? 'ONLINE_FRA_RELAY_PAIR_CONFLICT' : 'ONLINE_FRA_RELAY_PAIR_INVALID');
+    }
     if (pairs.size >= maxPairs) fail('ONLINE_FRA_RELAY_PAIR_CAPACITY_EXCEEDED');
-    const staged = new Set(seenDevices);
-    const pair = normalizedPair(input, staged);
-    if (pairs.has(pair.pairId)) fail('ONLINE_FRA_RELAY_PAIR_INVALID');
-    sink('online_fra.pair.registered', { pairId: pair.pairId, generation });
+    normalizedPair(pair, new Set(seenDevices));
+    return { pair, existing: false };
+  }
+
+  // No callbacks or other fallible work follow durable initialization. These
+  // synchronous map updates publish the already validated topology together.
+  function publishPair(pair) {
     seenDevices.add(pair.machineAId);
     if (pair.machineBId !== null) seenDevices.add(pair.machineBId);
     pairs.set(pair.pairId, pair);
+    if (completedRegistrations < Number.MAX_SAFE_INTEGER) completedRegistrations += 1;
+  }
+
+  function registerPair(input) {
+    const { pair } = planRegistration(input, false);
+    sink('online_fra.pair.registration_attempted', { pairId: pair.pairId, generation });
+    publishPair(pair);
     return Object.freeze({ pairId: pair.pairId, generation, pairCount: pairs.size });
+  }
+
+  // Hosted registration composes topology with its durable lease state. All
+  // topology checks and event handling happen before the SQLite transaction;
+  // if that transaction fails, its rollback leaves topology untouched too.
+  // An identical retry still checks durable generation/digest/revocation, and
+  // succeeds at capacity without deleting or resetting its nonce history.
+  function ensurePair(input) {
+    exactKeys(input, ['pairId', 'machineAId', 'machineBId', 'capabilityDigest', 'generation'], 'ONLINE_FRA_RELAY_PAIR_INVALID');
+    integer(input.generation, 'ONLINE_FRA_RELAY_PAIR_INVALID', 1);
+    if (input.generation !== generation) fail('ONLINE_FRA_RELAY_PAIR_CONFLICT');
+    const topology = {
+      pairId: input.pairId, machineAId: input.machineAId,
+      machineBId: input.machineBId, capabilityDigest: input.capabilityDigest
+    };
+    let planned = planRegistration(topology, true);
+    if (!leaseState || typeof leaseState.initializePair !== 'function') fail('ONLINE_FRA_LEASE_STATE_UNAVAILABLE');
+    if (!planned.existing) {
+      sink('online_fra.pair.registration_attempted', { pairId: planned.pair.pairId, generation });
+      // A trusted event consumer can call the core synchronously. Recheck its
+      // current maps before persistence rather than relying on a stale plan.
+      planned = planRegistration(topology, true);
+    }
+    const initialized = leaseState.initializePair({
+      pairId: planned.pair.pairId, generation, capabilityDigest: planned.pair.capabilityDigest
+    });
+    if (!plainObject(initialized) || initialized.ok !== true
+        || !['initialized', 'existing', 'conflict'].includes(initialized.outcome)) {
+      fail('ONLINE_FRA_LEASE_STATE_UNAVAILABLE');
+    }
+    if (initialized.outcome === 'conflict') fail('ONLINE_FRA_RELAY_PAIR_CONFLICT');
+    if (initialized.generation !== generation) fail('ONLINE_FRA_LEASE_STATE_UNAVAILABLE');
+    if (!planned.existing) publishPair(planned.pair);
+    return Object.freeze({
+      pairId: planned.pair.pairId, generation, pairCount: pairs.size,
+      outcome: planned.existing ? 'already-registered' : 'registered'
+    });
   }
 
   // Retirement is TOPOLOGY removal (account closed, machine removed), and it
@@ -798,7 +972,7 @@ function createOnlineFraRendezvousRelay(options = {}) {
       schemaVersion: 'online-fra-rendezvous-state.v1', enabled, generation,
       activeConnections: connections.size, activePairs: [...slots.values()].filter(value => value.size === 2).length,
       authoritativeLeaseState: enabled,
-      pairCount: pairs.size, maxPairs,
+      pairCount: pairs.size, maxPairs, completedRegistrations,
       queuedBytes: [...pairQueuedBytes.values()].reduce((sum, value) => sum + value, 0),
       maxFrameBytes, maxQueuedBytesPerConnection, maxQueuedBytesPerDevice, maxQueuedBytesPerPair,
       maxConnectionsPerDevice, maxConnectionsPerPair, secretValuesEmitted: false
@@ -806,8 +980,8 @@ function createOnlineFraRendezvousRelay(options = {}) {
   }
 
   return Object.freeze({
-    connect, connectionMetadata, route, take, close, revokePair, snapshot,
-    registerPair, retirePair,
+    connect, renew, connectionMetadata, route, take, close, revokePair, snapshot,
+    registerPair, ensurePair, retirePair,
     constants: Object.freeze({ LEASE_SCHEMA_VERSION, MAX_LEASE_TTL_MS, ENDPOINT_ROLES })
   });
 }

@@ -1,5 +1,8 @@
 'use strict';
 
+// Private fixtures must pass the file-permission gate before schema checks.
+if (process.platform !== 'win32') process.umask(0o077);
+
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
 const childProcess = require('node:child_process');

@@ -6,7 +6,7 @@
 //   "Nothing accumulates a log of your connections."
 //
 // The relay refuses to construct without an event sink, and once running it
-// hands the sink every connection accepted/closed, pair registered/paired/
+// hands the sink every connection accepted/closed, registration attempt, pair paired/
 // closed/retired/revoked, every routed frame (with pairId, deviceId,
 // peerDeviceId, bytes) and every dequeue -- each stamped with a time. Whether
 // the policy sentence is true is not decided by the relay, which merely emits;
@@ -23,7 +23,7 @@
 //   requires nothing at all -- an import of node:fs appearing here should fail
 //   review before it fails the test that checks for it.
 //
-//   MEMORY IS O(1) IN TRAFFIC. Counters per event type (a closed eight-member
+//   MEMORY IS O(1) IN TRAFFIC. Counters per event type (a closed
 //   vocabulary), byte and frame totals, and two timestamps -- first and last
 //   event seen. A relay that has moved a billion frames holds the same few
 //   numbers as one that has moved ten.
@@ -41,8 +41,11 @@
 
 const EVENT_TYPES = Object.freeze([
   'online_fra.connection.accepted',
+  'online_fra.connection.renewed',
   'online_fra.connection.closed',
-  'online_fra.pair.registered',
+  // This callback precedes durable initialization. Successful topology
+  // publications are counted by relay.snapshot().completedRegistrations.
+  'online_fra.pair.registration_attempted',
   'online_fra.pair.paired',
   'online_fra.pair.closed',
   'online_fra.pair.retired',

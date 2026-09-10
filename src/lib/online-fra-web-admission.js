@@ -35,19 +35,22 @@ function createOnlineFraWebAdmission({ relay, clock = () => Date.now() } = {}) {
   if (!relay || typeof relay.connect !== 'function') fail('ONLINE_FRA_WEB_ADMISSION_OPTIONS_INVALID');
   if (typeof clock !== 'function') fail('ONLINE_FRA_WEB_ADMISSION_OPTIONS_INVALID');
 
-  // nonce (base64url) -> expiresAtMs. Bounded and single-use: a nonce store
+  // nonce (base64url) -> { expiresAtMs, connectionId }. Bounded and single-use: a nonce store
   // that grows with refused attempts is a memory lever, so the oldest entry
   // dies when the cap is hit -- costing that oldest challenger a retry,
   // nothing else.
   const nonces = new Map();
 
   function sweep(atMs) {
-    for (const [nonce, expiresAtMs] of nonces) {
+    for (const [nonce, { expiresAtMs }] of nonces) {
       if (expiresAtMs <= atMs) nonces.delete(nonce);
     }
   }
 
-  function challenge() {
+  function challenge({ connectionId = null } = {}) {
+    if (connectionId !== null && (typeof connectionId !== 'string' || !/^conn_[A-Za-z0-9_-]{1,128}$/.test(connectionId))) {
+      fail('ONLINE_FRA_WEB_ADMISSION_CONNECTION_INVALID');
+    }
     const atMs = clock();
     sweep(atMs);
     if (nonces.size >= NONCE_STORE_MAX) {
@@ -55,7 +58,7 @@ function createOnlineFraWebAdmission({ relay, clock = () => Date.now() } = {}) {
       nonces.delete(oldest);
     }
     const nonce = crypto.randomBytes(NONCE_BYTES).toString('base64url');
-    nonces.set(nonce, atMs + NONCE_TTL_MS);
+    nonces.set(nonce, { expiresAtMs: atMs + NONCE_TTL_MS, connectionId });
     return Object.freeze({ nonce, expiresAtMs: atMs + NONCE_TTL_MS });
   }
 
@@ -64,7 +67,7 @@ function createOnlineFraWebAdmission({ relay, clock = () => Date.now() } = {}) {
    * failed possession proof consumes neither the lease's nonce (the durable
    * one, in the lease state) nor a challenge replay window beyond its own.
    */
-  function admit({ lease, browserPublicKeySpki, nonce, signature } = {}) {
+  function prove({ lease, browserPublicKeySpki, nonce, signature }, connectionId) {
     // ANY ROLE. This began as the browser's door because a browser cannot
     // present a client certificate. Machines may now use it too, signing with
     // the identity key they generated themselves -- see the note in
@@ -76,9 +79,12 @@ function createOnlineFraWebAdmission({ relay, clock = () => Date.now() } = {}) {
     // The nonce: known, unexpired, and SINGLE-USE -- deleted before any
     // verification, so even a verification crash cannot leave it replayable.
     if (typeof nonce !== 'string' || !nonces.has(nonce)) fail('ONLINE_FRA_WEB_ADMISSION_NONCE_UNKNOWN');
-    const expiresAtMs = nonces.get(nonce);
+    const issued = nonces.get(nonce);
     nonces.delete(nonce);
-    if (expiresAtMs <= clock()) fail('ONLINE_FRA_WEB_ADMISSION_NONCE_EXPIRED');
+    if (issued.expiresAtMs <= clock()) fail('ONLINE_FRA_WEB_ADMISSION_NONCE_EXPIRED');
+    // An admission challenge cannot authorize a renewal, or vice versa; a
+    // renewal is also bound to the exact connection that requested it.
+    if (issued.connectionId !== connectionId) fail('ONLINE_FRA_WEB_ADMISSION_CONNECTION_MISMATCH');
 
     // The key: canonical base64url SPKI Ed25519, and its digest must be the
     // one the SIGNED lease committed to -- the same "fingerprint of the
@@ -103,15 +109,24 @@ function createOnlineFraWebAdmission({ relay, clock = () => Date.now() } = {}) {
     } catch { proven = false; }
     if (proven !== true) fail('ONLINE_FRA_WEB_ADMISSION_PROOF_INVALID');
 
+    return Object.freeze({ verified: true, authType: 'key-lease', deviceId: lease.deviceId, mtlsFingerprint: lease.mtlsFingerprint });
+  }
+
+  function admit(request = {}) {
     return relay.connect({
       // 'web-lease' is what this module attested before it admitted machines; the
       // relay accepts both names for the web role so nothing in flight breaks.
-      identity: Object.freeze({ verified: true, authType: 'key-lease', deviceId: lease.deviceId, mtlsFingerprint: lease.mtlsFingerprint }),
-      lease
+      identity: prove(request, null),
+      lease: request.lease
     });
   }
 
-  return Object.freeze({ challenge, admit, pendingChallenges: () => nonces.size });
+  function renew({ connectionId, ...request } = {}) {
+    if (typeof connectionId !== 'string' || typeof relay.renew !== 'function') fail('ONLINE_FRA_WEB_RENEWAL_UNSUPPORTED');
+    return relay.renew({ connectionId, identity: prove(request, connectionId), lease: request.lease });
+  }
+
+  return Object.freeze({ challenge, admit, renew, cancelChallenge: nonce => nonces.delete(nonce), pendingChallenges: () => nonces.size });
 }
 
 module.exports = Object.freeze({ OnlineFraWebAdmissionError, createOnlineFraWebAdmission, NONCE_TTL_MS });

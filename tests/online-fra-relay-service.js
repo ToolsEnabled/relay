@@ -137,39 +137,44 @@ async function controlCall(port, name, body, token = TOKEN) {
     equal(registered.body.outcome, 'already-registered');
     equal((await controlCall(controlPort, 'health')).body.relay.pairCount, 1);
 
-    /* A SOLO pair -- one computer; machineBId present and null -- registers
-       over the same route as 'registered', and the composed deletion takes it
-       down again. (Nothing restored it at boot: LIVE_PAIRS_SQL and ASK_SQL
-       still join BOTH machines, and the account side's shape for a solo pair
-       is not decided here.) */
-    const solo = await controlCall(controlPort, 'register-pair', {
+    // Registration requires the account's current tuple, including for solo
+    // pairs. A control token alone cannot publish arbitrary account topology.
+    const soloInput = {
       pairId: 'pair-' + '2'.repeat(32), generation: 1, capabilityDigest: DIGEST,
       machineAId: 'device-' + 'c'.repeat(24), machineBId: null
-    });
+    };
+    const unowned = await controlCall(controlPort, 'register-pair', soloInput);
+    equal(unowned.status, 409);
+    equal(unowned.body.code, 'RELAY_SERVICE_PAIR_UNAUTHORIZED');
+    {
+      const db = new DatabaseSync(accountDbPath);
+      db.prepare('INSERT INTO devices VALUES (?, ?, ?, 1, NULL, ?, ?)')
+        .run('pair-' + 'c'.repeat(32), 'account-1', 'Solo control fixture', soloInput.machineAId, 'd'.repeat(64));
+      db.prepare('INSERT INTO relay_pairs VALUES (?, ?, ?, NULL, ?, 1)')
+        .run(soloInput.pairId, 'account-1', 'pair-' + 'c'.repeat(32), DIGEST);
+      db.close();
+    }
+    const solo = await controlCall(controlPort, 'register-pair', soloInput);
     equal(solo.status, 200);
     equal(solo.body.outcome, 'registered', 'a solo pair is accepted over the control channel');
     equal((await controlCall(controlPort, 'health')).body.relay.pairCount, 2);
     const soloGone = await controlCall(controlPort, 'delete-pair', { pairId: 'pair-' + '2'.repeat(32) });
     equal(soloGone.body.outcome, 'deleted');
     equal((await controlCall(controlPort, 'health')).body.relay.pairCount, 1);
+    {
+      const db = new DatabaseSync(accountDbPath);
+      db.prepare('DELETE FROM relay_pairs WHERE relay_pair_id = ?').run(soloInput.pairId);
+      db.prepare('DELETE FROM devices WHERE pair_id = ?').run('pair-' + 'c'.repeat(32));
+      db.close();
+    }
 
-    /* OMITTING machineBId is NOT the solo shape. The relay core refuses it
-       (ONLINE_FRA_RELAY_PAIR_INVALID: the key must be present and exactly
-       null -- the server sends `machineBId: null` explicitly), and this route
-       must never answer 'registered' for it. What it answers today, MEASURED:
-       'already-registered'. The catch in actions['register-pair'] maps EVERY
-       ONLINE_FRA_RELAY_PAIR_INVALID raised after a successful initializePair
-       to that outcome -- it was written for the retry-after-restart case and
-       is wider than it. Pre-existing, not changed here; pinned so the next
-       reader is not surprised by it, and so that 'registered' can never be
-       the answer and nothing is registered. */
+    // Omitting B is malformed, not a successful retry or an implicit solo.
     const omitted = await controlCall(controlPort, 'register-pair', {
       pairId: 'pair-' + '4'.repeat(32), generation: 1, capabilityDigest: DIGEST,
       machineAId: 'device-' + 'd'.repeat(24)
     });
-    equal(omitted.status, 200);
-    ok(omitted.body.outcome !== 'registered', 'a register-pair that omits machineBId is never reported registered');
-    equal(omitted.body.outcome, 'already-registered', 'the measured pre-existing answer for an omitted machineBId (see the comment above)');
+    equal(omitted.status, 409);
+    equal(omitted.body.code, 'ONLINE_FRA_RELAY_PAIR_INVALID');
     equal((await controlCall(controlPort, 'health')).body.relay.pairCount, 1, 'and nothing was registered');
 
     // Deletion is the composed teardown, idempotent end to end.
