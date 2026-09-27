@@ -11,6 +11,7 @@
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
 const http = require('node:http');
+const net = require('node:net');
 const { WebSocketServer } = require('ws');
 const { createOnlineFraWebAdmission } = require('../src/lib/online-fra-web-admission');
 const { createOnlineFraWebSocketAdapter } = require('../src/lib/online-fra-websocket-adapter');
@@ -130,6 +131,72 @@ function connectAndAdmit(url, ep) {
   });
   equal(refused, 1008, 'a signature from a key other than the fingerprinted one closes the socket with policy violation');
   equal(relay.snapshot().connections, 2, 'and the relay never saw it');
+
+  /* THE ADMISSION SLOT MUST COME BACK WHEN THE HANDSHAKE NEVER COMPLETES.
+   *
+   * This is the one finding from the edge pentest that a reader would not get
+   * from the state machine, because it lives in the contract of somebody else's
+   * library. upgrade() takes a per-address admission slot and returns it from its
+   * synchronous catch or from closeContext() -- and closeContext only runs once
+   * the handleUpgrade callback has fired. ws@8 does neither for a malformed
+   * handshake: given a missing or invalid Sec-WebSocket-Key or an unsupported
+   * Sec-WebSocket-Version it destroys the socket and returns WITHOUT calling back
+   * and WITHOUT throwing. So one routed-but-malformed GET leaked one slot, for
+   * good: no race, no timing, just repetition.
+   *
+   * MEASURED on the pre-fix tree with maxSockets 8 / maxSocketsPerIp 4: twelve
+   * malformed upgrades and a legitimate client was then refused outright. From a
+   * single IPv6 /64 the same trick filled the whole rate table, after which every
+   * address the relay had not already seen was refused -- an unauthenticated,
+   * silent, permanent denial of service on a remote-access product, cleared only
+   * by restarting the process.
+   *
+   * Asserted with a REAL malformed handshake rather than a stubbed one, because a
+   * fake socket would be asserting my model of ws, which is the thing that was
+   * wrong in the first place. */
+  {
+    /* ITS OWN EDGE, WITH A SMALL BUDGET, AND THAT DETAIL IS THE TEST.
+       The adapter above runs on the defaults -- maxSocketsPerIp 64 -- so twelve
+       leaked slots prove nothing: the first version of this test passed against
+       the PRE-FIX adapter and was therefore worthless. The leak is only visible
+       once the per-address budget is small enough to exhaust, which is exactly
+       how the pentest found it (maxSockets 8, maxSocketsPerIp 4). A regression
+       test that cannot fail on the unfixed code is not a regression test. */
+    const leakRelay = relayDouble();
+    const leakServer = http.createServer((q, r) => { r.statusCode = 426; r.end(); });
+    const leakAdapter = createOnlineFraWebSocketAdapter({
+      enabled: true, WebSocketServer, httpServer: leakServer, relay: leakRelay,
+      hostname: 'relay.example.net', verifyProxyRequest: () => ({ ok: false }),
+      keyAdmission: createOnlineFraWebAdmission({ relay: leakRelay, clock: () => Date.now() }),
+      eventSink: () => {}, clock: () => Date.now(),
+      setTimer: (fn, ms) => setTimeout(fn, ms), clearTimer: (id) => clearTimeout(id),
+      maxAdmissionBytes: 4096, pingIntervalMs: 1000, idleTimeoutMs: 5000,
+      maxSockets: 8, maxSocketsPerIp: 4,
+    });
+    leakAdapter.start();
+    await new Promise((r) => leakServer.listen(0, '127.0.0.1', r));
+    const leakPort = leakServer.address().port;
+
+    await Promise.all(Array.from({ length: 12 }, () => new Promise((resolve) => {
+      const socket = net.connect(leakPort, '127.0.0.1', () => {
+        socket.write('GET /v1/rendezvous HTTP/1.1\r\nHost: relay.example.net\r\n'
+          + 'Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 99\r\n\r\n');
+      });
+      socket.on('data', () => {});
+      socket.on('error', () => resolve());
+      socket.on('close', () => resolve());
+      setTimeout(() => { socket.destroy(); resolve(); }, 250);
+    })));
+    await new Promise((r) => setTimeout(r, 150));
+
+    const after = await connectAndAdmit(`ws://127.0.0.1:${leakPort}/v1/rendezvous`,
+      endpoint('machine-a', 'pair-slot'));
+    equal(after.ws.readyState, 1,
+      'a legitimate client is still admitted after twelve malformed handshakes');
+    after.ws.close();
+    leakAdapter.stop();
+    await new Promise((r) => leakServer.close(r));
+  }
 
   A.ws.close(); B.ws.close();
   adapter.stop();

@@ -18,7 +18,15 @@
 const crypto = require('node:crypto');
 
 const NONCE_TTL_MS = 60_000;
-const NONCE_STORE_MAX = 1024;
+/* Comfortably above any edge socket ceiling. This was 1024 and the hosted edge
+ * ran with maxSockets 64, so the store was never within an order of magnitude
+ * of full -- it was safe by accident of a ceiling that was itself a defect.
+ * With the edge corrected to its real capacity, 1024 sockets each holding a
+ * live challenge sat exactly ON this bound, where every new challenge evicted
+ * the OLDEST: an honest browser that had just been handed its nonce and was
+ * computing its WebCrypto signature. An attacker opening sockets could evict
+ * honest challengers deterministically. */
+const NONCE_STORE_MAX = 8192;
 const NONCE_BYTES = 32;
 
 class OnlineFraWebAdmissionError extends Error {
@@ -53,6 +61,16 @@ function createOnlineFraWebAdmission({ relay, clock = () => Date.now() } = {}) {
     }
     const atMs = clock();
     sweep(atMs);
+    /* ONE LIVE CHALLENGE PER CONNECTION. A connection asking again replaces
+       its OWN nonce rather than pushing a stranger's out of the store, which
+       is what makes the store size track live connections instead of total
+       attempts. The global eviction below stays as a last-resort memory
+       guard, and with the raised bound it is not reached in normal service. */
+    if (connectionId !== null) {
+      for (const [existing, entry] of nonces) {
+        if (entry.connectionId === connectionId) nonces.delete(existing);
+      }
+    }
     if (nonces.size >= NONCE_STORE_MAX) {
       const oldest = nonces.keys().next().value;
       nonces.delete(oldest);
@@ -129,4 +147,4 @@ function createOnlineFraWebAdmission({ relay, clock = () => Date.now() } = {}) {
   return Object.freeze({ challenge, admit, renew, cancelChallenge: nonce => nonces.delete(nonce), pendingChallenges: () => nonces.size });
 }
 
-module.exports = Object.freeze({ OnlineFraWebAdmissionError, createOnlineFraWebAdmission, NONCE_TTL_MS });
+module.exports = Object.freeze({ OnlineFraWebAdmissionError, createOnlineFraWebAdmission, NONCE_TTL_MS, NONCE_STORE_MAX });

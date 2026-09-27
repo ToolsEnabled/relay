@@ -239,7 +239,10 @@ withTempLicenseStore(store => {
         ok: true, tlsSni: 'hosted.relay.example.net', clientVerify: 'SUCCESS', deviceId: 'hosted-a', fingerprint: 'a'.repeat(64), ip: '10.0.0.9'
       }),
       clock: () => timers.now, setTimer: timers.set, clearTimer: timers.clear,
-      maxFrameBytes: 1024, maxAdmissionBytes: 8192, maxSockets: 4, maxSocketsPerIp: 4, maxAdmissionsPerIp: 8,
+      maxFrameBytes: 1024, maxAdmissionBytes: 8192, maxSockets: 8, maxSocketsPerIp: 4, maxAdmissionsPerIp: 8,
+      // maxSocketsPerIp must stay BELOW maxSockets: a per-address share equal to the
+      // whole pool is not a share, and the adapter now refuses that configuration at
+      // construction. This read 4 and 4, which the guard rejects.
       admissionWindowMs: 1000, admissionTimeoutMs: 500, pingIntervalMs: 10000, idleTimeoutMs: 20000, maxBufferedBytes: 1024, maxDrainPerTick: 3
     });
     adapter.start();

@@ -78,6 +78,38 @@ function plain(value) { return Boolean(value) && typeof value === 'object' && !A
 function integer(value, code, min, max) { if (!Number.isSafeInteger(value) || value < min || value > max) fail(code); return value; }
 function sync(value, code) { if (value && typeof value.then === 'function') fail(code); return value; }
 function safeHostname(value) { if (typeof value !== 'string' || !/^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/.test(value)) fail('ONLINE_FRA_WS_OPTIONS_INVALID'); return value; }
+/* THE RATE KEY IS A SITE, NOT AN ADDRESS.
+ *
+ * The per-IP tables were keyed on the full address, which is a meaningful unit
+ * for IPv4 and almost none for IPv6: a single /64 -- the standard end-site
+ * allocation, handed out by any VPS -- yields unlimited distinct addresses from
+ * one machine. That bought an attacker a fresh maxSocketsPerIp budget per
+ * address AND let them fill the 8192-entry table, after which every address the
+ * relay had not already seen was refused admission outright.
+ *
+ * IPv6 is therefore bucketed to its /64 and IPv4 kept whole. Anything that does
+ * not parse cleanly falls back to the address itself, so a malformed value can
+ * only ever be treated as its own bucket -- never merged into somebody else's.
+ */
+function rateKeyFor(value) {
+  if (typeof value !== 'string' || net.isIP(value) !== 6) return value;
+  const bare = value.toLowerCase().split('%')[0];
+  const mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/.exec(bare);
+  if (mapped) return mapped[1];
+  if (bare.indexOf('.') !== -1) return value;
+  const halves = bare.split('::');
+  if (halves.length > 2) return value;
+  const head = halves[0] ? halves[0].split(':') : [];
+  const tail = halves.length === 2 && halves[1] ? halves[1].split(':') : [];
+  const missing = 8 - head.length - tail.length;
+  if (halves.length === 1 ? head.length !== 8 : missing < 0) return value;
+  const groups = halves.length === 1
+    ? head
+    : [...head, ...new Array(missing).fill('0'), ...tail];
+  if (groups.length !== 8 || groups.some(group => !/^[0-9a-f]{1,4}$/.test(group))) return value;
+  return groups.slice(0, 4).map(group => group.replace(/^0+(?=.)/, '')).join(':') + '::/64';
+}
+
 function safeIp(value) { return typeof value === 'string' && net.isIP(value) !== 0; }
 function metadataFingerprint(attestation) { return crypto.createHash('sha256').update(`${attestation.deviceId}|${attestation.fingerprint}|${attestation.ip}`, 'utf8').digest('hex').slice(0, 16); }
 
@@ -124,6 +156,12 @@ function createOnlineFraWebSocketAdapter(options = {}) {
   let started = false;
   let wss = null;
   const live = new Set();
+  /* A PER-IP SHARE THAT CAN EQUAL THE WHOLE POOL IS NOT A SHARE. Shipped
+     configuration had maxSockets 64 and maxSocketsPerIp 64, so a single
+     address was entitled to every socket the relay had and four of them held
+     the public edge permanently full. Refuse to construct such a relay rather
+     than run one that cannot enforce the limit it advertises. */
+  if (config.maxSocketsPerIp >= config.maxSockets) fail('ONLINE_FRA_WS_OPTIONS_INVALID');
   const rate = new Map();
   let nextRateSweepAt = 0;
 
@@ -189,7 +227,8 @@ function createOnlineFraWebSocketAdapter(options = {}) {
     }
     return req && req.socket ? req.socket.remoteAddress : null;
   }
-  function admissionSlot(ip) {
+  function admissionSlot(rawIp) {
+    const ip = rateKeyFor(rawIp);
     const now = config.clock();
     // An unauthenticated socket may close before its IP window ends. Reclaim
     // those inactive windows, and bound retained distinct addresses without
@@ -201,7 +240,15 @@ function createOnlineFraWebSocketAdapter(options = {}) {
       nextRateSweepAt = now + Math.min(config.admissionWindowMs, 1000);
     }
     let state = rate.get(ip);
-    if (!state && rate.size >= MAX_RATE_ENTRIES) return null;
+    if (!state && rate.size >= MAX_RATE_ENTRIES) {
+      /* Full, with nothing stale to reclaim. Refusing here refused every
+         address the relay had not already seen -- an admission outage for new
+         customers, bought by filling a table. This dimension is supplementary:
+         the global maxSockets ceiling still binds every connection, and the
+         entries already held keep their budgets, so filling the table costs an
+         attacker the per-site guard and never the service. */
+      return { windowStart: now, admissions: 1, active: 1, untracked: true };
+    }
     if (!state || now - state.windowStart >= config.admissionWindowMs) state = { windowStart: now, admissions: 0, active: state ? state.active : 0 };
     if (state.admissions >= config.maxAdmissionsPerIp || state.active >= config.maxSocketsPerIp) return null;
     state.admissions += 1;
@@ -209,7 +256,8 @@ function createOnlineFraWebSocketAdapter(options = {}) {
     rate.set(ip, state);
     return state;
   }
-  function releaseSlot(ip) {
+  function releaseSlot(rawIp) {
+    const ip = rateKeyFor(rawIp);
     const state = rate.get(ip);
     if (!state) return;
     state.active = Math.max(0, state.active - 1);
@@ -585,10 +633,55 @@ function createOnlineFraWebSocketAdapter(options = {}) {
     if (!started || !req || req.method !== 'GET' || req.url !== '/v1/rendezvous' || !Buffer.isBuffer(head) || head.length !== 0 || live.size >= config.maxSockets) return reject(socket);
     const attestation = attestationFor(req);
     if (!attestation || !admissionSlot(attestation.ip)) return reject(socket);
-    try {
-      wss.handleUpgrade(req, socket, head, ws => attach(ws, attestation));
-    } catch {
+    /* THE SLOT MUST COME BACK EVEN IF THE HANDSHAKE NEVER FINISHES.
+     *
+     * handleUpgrade is asynchronous: it completes the HTTP upgrade and only
+     * then calls back. A client that aborts in between -- destroys the socket
+     * mid-handshake -- produced no context, so closeContext (the only other
+     * caller of releaseSlot) never ran, and the synchronous catch below never
+     * fired either. `active` then stayed raised for that address FOREVER.
+     *
+     * That is not merely a leaked counter. `active` is what the per-IP socket
+     * budget is measured against, so 64 aborted upgrades permanently bar one
+     * address; and the sweep only reclaims entries whose active is 0, so each
+     * leak also pins a `rate` slot. Once MAX_RATE_ENTRIES of them accumulate,
+     * admissionSlot returns null for every address it has not already seen and
+     * the edge stops admitting anyone -- unauthenticated, permanent, and cheap.
+     *
+     * Release exactly once: the raw socket's own close/error return the slot
+     * while the handshake is still in flight, and attach() takes ownership the
+     * moment it runs, after which closeContext owns the release. */
+    let slotSettled = false;
+    const releaseUpgradeSlot = () => {
+      if (slotSettled) return;
+      slotSettled = true;
       releaseSlot(attestation.ip);
+    };
+    const detachUpgradeGuard = () => {
+      if (typeof socket.off !== 'function') return;
+      socket.off('close', releaseUpgradeSlot);
+      socket.off('error', releaseUpgradeSlot);
+    };
+    if (typeof socket.once === 'function') {
+      socket.once('close', releaseUpgradeSlot);
+      socket.once('error', releaseUpgradeSlot);
+    }
+    try {
+      wss.handleUpgrade(req, socket, head, ws => {
+        // attach() owns the slot from here; closeContext returns it.
+        slotSettled = true;
+        detachUpgradeGuard();
+        try { attach(ws, attestation); }
+        catch (error) {
+          // attach never built a context, so nothing else will release it.
+          releaseSlot(attestation.ip);
+          try { ws.close(); } catch { /* already gone */ }
+          throw error;
+        }
+      });
+    } catch {
+      detachUpgradeGuard();
+      releaseUpgradeSlot();
       reject(socket);
     }
   }

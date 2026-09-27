@@ -5,7 +5,7 @@
 
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
-const { createOnlineFraWebAdmission } = require('../src/lib/online-fra-web-admission');
+const { createOnlineFraWebAdmission, NONCE_STORE_MAX } = require('../src/lib/online-fra-web-admission');
 
 let assertions = 0;
 function equal(actual, expected, message) { assertions += 1; assert.equal(actual, expected, message); }
@@ -85,10 +85,43 @@ function signed(nonce, key = browser.privateKey) {
 }
 
 // The store is bounded: hammering challenge() cannot grow memory past the cap.
+//
+// BOUND TO THE EXPORTED CONSTANT, NOT A LITERAL, and the loop has to exceed it.
+// This read `3000` against a hardcoded `1024` and asserted <= 1024. When the cap
+// was raised to 8192 the assertion failed -- correctly, it was pinning the old
+// number -- but the deeper problem is that 3000 challenges never reached a cap of
+// 8192 at all, so the version of this test that merely swapped the literal would
+// have exercised no eviction and passed for the wrong reason.
 {
   const { admission } = harness();
-  for (let index = 0; index < 3000; index += 1) admission.challenge();
-  ok(admission.pendingChallenges() <= 1024, `bounded (${admission.pendingChallenges()})`);
+  for (let index = 0; index < NONCE_STORE_MAX + 200; index += 1) admission.challenge();
+  ok(admission.pendingChallenges() <= NONCE_STORE_MAX,
+    `bounded (${admission.pendingChallenges()} > ${NONCE_STORE_MAX})`);
+}
+
+// ONE LIVE CHALLENGE PER CONNECTION, which is the actual fix and not merely a
+// larger number.
+//
+// WHY IT MATTERS, stated as the attack it closes: eviction is oldest-first, so
+// while a connection could add an unbounded number of live challenges, an attacker
+// opening sockets could push the store to its bound and then evict honest
+// challengers deterministically -- specifically a browser that had just been handed
+// its nonce and was still computing its WebCrypto signature over it. Replacing a
+// connection's OWN nonce makes the store size track live connections rather than
+// total attempts, so the global eviction below is a memory guard rather than an
+// attacker-steerable queue.
+{
+  const { admission } = harness();
+  const first = admission.challenge({ connectionId: 'conn_a' }).nonce;
+  const second = admission.challenge({ connectionId: 'conn_a' }).nonce;
+  equal(admission.pendingChallenges(), 1, 'asking twice on one connection leaves one live challenge');
+  ok(first !== second, 'the replacement is a fresh nonce, not the same one handed out again');
+
+  // And it replaces only its own: a second connection is untouched.
+  admission.challenge({ connectionId: 'conn_b' });
+  equal(admission.pendingChallenges(), 2, 'a different connection keeps its own challenge');
+  admission.challenge({ connectionId: 'conn_a' });
+  equal(admission.pendingChallenges(), 2, "conn_a's re-ask did not evict conn_b");
 }
 
 // MACHINES MAY COME THROUGH THIS DOOR TOO (2026-08-20). A machine signing with

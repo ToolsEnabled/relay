@@ -61,6 +61,20 @@ function upgrade(test, request = { method: 'GET', url: '/v1/rendezvous' }, ws = 
 
 (() => {
   throws(() => createOnlineFraWebSocketAdapter({}), error => error && error.code === 'ONLINE_FRA_WS_OPTIONS_INVALID');
+
+  /* A PER-ADDRESS SHARE EQUAL TO THE WHOLE POOL IS NOT A SHARE, and it shipped.
+     The published relay's own entrypoint set maxSockets 64 while the adapter's
+     maxSocketsPerIp default was also 64, so one address could hold the entire
+     edge and nothing refused the configuration. PENTESTED on the pre-fix tree:
+     the adapter constructed happily with 64/64. It is a construction refusal
+     rather than a clamp, because silently narrowing an operator's number would
+     leave them believing a limit they do not have. */
+  throws(() => fixture({ maxSockets: 64, maxSocketsPerIp: 64 }),
+    error => error && error.code === 'ONLINE_FRA_WS_OPTIONS_INVALID');
+  throws(() => fixture({ maxSockets: 8, maxSocketsPerIp: 9 }),
+    error => error && error.code === 'ONLINE_FRA_WS_OPTIONS_INVALID');
+  ok(fixture({ maxSockets: 8, maxSocketsPerIp: 4 }).adapter,
+    'a per-IP share strictly below the pool is accepted');
   const inert = fixture({ enabled: false });
   equal(inert.adapter.snapshot().started, false); equal(inert.adapter.start(), false); equal(FakeWss.instances.length, 0);
   const test = fixture(); equal(test.adapter.start(), true); equal(test.adapter.start(), false);

@@ -420,6 +420,20 @@ function createOnlineFraRendezvousRelay(options = {}) {
     return pairKey(record.pairId, record.generation);
   }
 
+  /* renew()'s staleness rule, reused. A reconnecting machine may replace its
+     own stale connection exactly when a renewal on that connection would have
+     been accepted: identical identity, strictly fresher lease. */
+  const RENEWAL_IDENTITY_FIELDS = Object.freeze([
+    'pairId', 'deviceId', 'peerDeviceId', 'endpointRole', 'generation', 'mtlsFingerprint'
+  ]);
+  function supersedesIncumbent(fresh, record) {
+    for (const field of RENEWAL_IDENTITY_FIELDS) {
+      if (fresh[field] !== record[field]) return false;
+    }
+    return fresh.leaseId !== record.leaseId && fresh.nonce !== record.nonce
+      && fresh.issuedAtMs >= record.issuedAtMs && fresh.expiresAtMs > record.expiresAtMs;
+  }
+
   function discard(record, reason, emit = true) {
     if (!record || record.closed) return false;
     record.closed = true;
@@ -613,10 +627,35 @@ function createOnlineFraRendezvousRelay(options = {}) {
     // that reason); the single web slot sits beside it, so the pair-capacity
     // check counts machine connections only and the web role's own cap is the
     // one-slot displacement below.
-    if ((deviceConnections.get(leaseValue.deviceId) || 0) >= maxConnectionsPerDevice
-        || (!isWeb && (pairConnections.get(key) || 0) >= maxConnectionsPerPair)) fail('ONLINE_FRA_CONNECTION_CAPACITY_EXCEEDED');
     const pairSlots = slots.get(key) || new Map();
-    if (!isWeb && pairSlots.has(leaseValue.endpointRole)) fail('ONLINE_FRA_DUPLICATE_ENDPOINT_ROLE');
+    /* A MACHINE COMING BACK IS NOT A SECOND MACHINE.
+     *
+     * When a machine's socket dies without a clean close -- a closed lid, a
+     * Wi-Fi roam, an ISP blip -- the relay keeps its record until the edge
+     * notices, which takes a 30s unanswered ping and a 75s idle timeout. The
+     * machine reconnects immediately with a freshly signed lease naming the
+     * same device, and this refused it: the per-device budget is 1 and the
+     * role slot is taken, so the arrival lost to a connection that is already
+     * gone. For up to 75 seconds the product then reported the customer's own
+     * computer as not answering and dropped every frame the browser sent.
+     * A second browser tab, meanwhile, displaces cleanly a few lines below --
+     * so the two roles behaved differently for no reason the customer could see.
+     *
+     * The incumbent is replaced only by a lease that renew() would itself have
+     * accepted on that connection: every identity field equal, and strictly
+     * fresher lease id, nonce, issue and expiry. That grants no new authority
+     * -- the same caller could take the slot anyway once the timeout elapsed --
+     * and a lease naming a different device or fingerprint still loses. */
+    const incumbent = !isWeb ? pairSlots.get(leaseValue.endpointRole) : undefined;
+    const superseded = incumbent && !incumbent.closed && supersedesIncumbent(leaseValue, incumbent)
+      ? incumbent
+      : null;
+    const deviceHeld = (deviceConnections.get(leaseValue.deviceId) || 0)
+      - (superseded && superseded.deviceId === leaseValue.deviceId ? 1 : 0);
+    const pairHeld = (pairConnections.get(key) || 0) - (superseded ? 1 : 0);
+    if (deviceHeld >= maxConnectionsPerDevice
+        || (!isWeb && pairHeld >= maxConnectionsPerPair)) fail('ONLINE_FRA_CONNECTION_CAPACITY_EXCEEDED');
+    if (!isWeb && pairSlots.has(leaseValue.endpointRole) && !superseded) fail('ONLINE_FRA_DUPLICATE_ENDPOINT_ROLE');
     // Consulted before admitLease on purpose: an authority refusal must not
     // consume the nonce, or a transient account-side outage would burn every
     // lease presented during it and the customer would need fresh leases for
@@ -639,6 +678,8 @@ function createOnlineFraRendezvousRelay(options = {}) {
     if (isWeb && pairSlots.has('web-client')) {
       discard(pairSlots.get('web-client'), 'ONLINE_FRA_WEB_DISPLACED');
     }
+    // Same discipline as the web slot above: every admission check has run.
+    if (superseded) discard(superseded, 'ONLINE_FRA_MACHINE_DISPLACED');
     const record = {
       connectionId: id, pairId: pair.pairId, deviceId: leaseValue.deviceId,
       peerDeviceId: leaseValue.peerDeviceId, endpointRole: leaseValue.endpointRole,

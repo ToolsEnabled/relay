@@ -14,7 +14,7 @@ const path = require('node:path');
 const http = require('node:http');
 const { createOnlineFraRelayService } = require('../src/lib/online-fra-relay-service');
 const { createOnlineFraWebAdmission } = require('../src/lib/online-fra-web-admission');
-const { createOnlineFraWebSocketAdapter } = require('../src/lib/online-fra-websocket-adapter');
+const { createOnlineFraWebSocketAdapter, DEFAULTS: EDGE_DEFAULTS } = require('../src/lib/online-fra-websocket-adapter');
 
 const configPath = process.argv[2];
 if (!configPath) {
@@ -114,7 +114,13 @@ function startEdge() {
     clock: () => Date.now(),
     setTimer: (fn, ms) => setTimeout(fn, ms),
     clearTimer: id => clearTimeout(id),
-    maxSockets: Number.isInteger(edge.maxSockets) ? edge.maxSockets : 64
+    /* This repeated a literal 64 while the adapter's own default was 512, and
+       nothing set edge.maxSockets in the deployed relay.json -- so the hosted
+       relay ran with a GLOBAL ceiling of 64 sockets while believing it had
+       512. A shell that duplicates a library constant drifts from it silently,
+       so read the constant instead of restating it. */
+    maxSockets: Number.isInteger(edge.maxSockets) ? edge.maxSockets : EDGE_DEFAULTS.maxSockets,
+    ...(Number.isInteger(edge.maxSocketsPerIp) ? { maxSocketsPerIp: edge.maxSocketsPerIp } : {})
   });
   adapter.start();
   return new Promise((resolve, reject) => {
