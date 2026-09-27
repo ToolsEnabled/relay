@@ -59,6 +59,22 @@ function upgrade(test, request = { method: 'GET', url: '/v1/rendezvous' }, ws = 
   const socket = new FakeSocket(); socket.ws = ws; test.httpServer.handlers.get('upgrade')(request, socket, head); return { socket, ws };
 }
 
+
+/* The header rules below govern the KEY door, which is the door production
+   actually uses (verifyProxyRequest returns {ok:false} there). On the certificate
+   door the address comes from the attestation instead, so a fixture with a cert
+   stub would test the wrong path -- and did, until this helper existed. */
+function keyDoor(overrides = {}) {
+  const { createOnlineFraWebAdmission } = require('../src/lib/online-fra-web-admission');
+  const relay = {
+    connect: () => ({ connectionId: 'c1' }),
+    connectionMetadata: () => ({ peerConnectionId: null, endpointRole: 'web-client', legs: {} }),
+    route: () => {}, take: () => null, close: () => {},
+  };
+  return fixture({ relay, verifyProxyRequest: () => ({ ok: false }),
+    keyAdmission: createOnlineFraWebAdmission({ relay, clock: () => 1 }), ...overrides });
+}
+
 (() => {
   throws(() => createOnlineFraWebSocketAdapter({}), error => error && error.code === 'ONLINE_FRA_WS_OPTIONS_INVALID');
 
@@ -75,6 +91,7 @@ function upgrade(test, request = { method: 'GET', url: '/v1/rendezvous' }, ws = 
     error => error && error.code === 'ONLINE_FRA_WS_OPTIONS_INVALID');
   ok(fixture({ maxSockets: 8, maxSocketsPerIp: 4 }).adapter,
     'a per-IP share strictly below the pool is accepted');
+
   const inert = fixture({ enabled: false });
   equal(inert.adapter.snapshot().started, false); equal(inert.adapter.start(), false); equal(FakeWss.instances.length, 0);
   const test = fixture(); equal(test.adapter.start(), true); equal(test.adapter.start(), false);
@@ -337,5 +354,50 @@ function upgrade(test, request = { method: 'GET', url: '/v1/rendezvous' }, ws = 
   }
 
   ok(DEFAULTS.maxFrameBytes > 0);
+  /* THE PER-IP BUDGET IS ONLY A BUDGET IF THE CLIENT CANNOT CHOOSE ITS OWN KEY.
+     The edge reads the client address from X-FRA-Client-Address or X-Real-IP and
+     falls back to the socket peer. Two things were wrong. X-Real-IP was read
+     FIRST although the vhost this repository renders never set it, so nginx
+     forwarded the CLIENT's value and the client picked its own rate-limit key.
+     And a header was trusted even when the socket peer was a public address --
+     when there is demonstrably no proxy in front and the peer is the better
+     answer.
+
+     PENTESTED on the published tree with maxSocketsPerIp 3: eight connections
+     from one source address and no header gave 3 upgrades, the cap holding;
+     the same eight rotating X-Real-IP gave 8. */
+  {
+    // A public peer means no proxy: headers are ignored and the peer is the key,
+    // so rotating X-Real-IP buys nothing. maxSocketsPerIp is 1 in this fixture.
+    const test = keyDoor(); test.adapter.start();
+    const req = (xri) => ({ method: 'GET', url: '/v1/rendezvous',
+      headers: { 'x-real-ip': xri }, socket: { remoteAddress: '203.0.113.9' } });
+    equal(upgrade(test, req('198.51.100.1')).socket.destroyed, false,
+      'the first connection from a public peer is admitted');
+    equal(upgrade(test, req('198.51.100.2')).socket.destroyed, true,
+      'a second connection from the same public peer is refused despite a different X-Real-IP');
+  }
+  {
+    // A loopback peer IS plausibly a proxy, so an attested header is honoured and
+    // two distinct addresses legitimately get distinct budgets.
+    const test = keyDoor(); test.adapter.start();
+    const req = (addr) => ({ method: 'GET', url: '/v1/rendezvous',
+      headers: { 'x-fra-client-address': addr }, socket: { remoteAddress: '127.0.0.1' } });
+    equal(upgrade(test, req('198.51.100.1')).socket.destroyed, false, 'first proxied address admitted');
+    equal(upgrade(test, req('198.51.100.2')).socket.destroyed, false, 'a different proxied address gets its own budget');
+  }
+  {
+    // X-FRA-Client-Address is the name THIS project's vhost sets, so it wins over
+    // X-Real-IP. Same attested address twice, different spoofed X-Real-IP: the
+    // second is refused, which proves the spoofed header did not become the key.
+    const test = keyDoor(); test.adapter.start();
+    const req = (xri) => ({ method: 'GET', url: '/v1/rendezvous',
+      headers: { 'x-fra-client-address': '198.51.100.5', 'x-real-ip': xri },
+      socket: { remoteAddress: '127.0.0.1' } });
+    equal(upgrade(test, req('198.51.100.70')).socket.destroyed, false, 'first attested connection admitted');
+    equal(upgrade(test, req('198.51.100.71')).socket.destroyed, true,
+      'the attested address is the key, not the spoofable one');
+  }
+
   console.log(`Online FRA websocket adapter tests passed (${assertions} assertions).`);
 })();

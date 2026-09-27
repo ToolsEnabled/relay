@@ -200,6 +200,12 @@ function render(value = {}) {
     '        proxy_set_header X-FRA-Client-Verify $ssl_client_verify;',
     '        proxy_set_header X-FRA-Client-Certificate $ssl_client_escaped_cert;',
     '        proxy_set_header X-FRA-Client-Address $remote_addr;',
+    // X-Real-IP IS SET TOO, and not for nginx convention. The edge reads both
+    // names, so any name it trusts must be OVERWRITTEN here -- a header this
+    // config does not set is one nginx forwards from the client, and a client
+    // that chooses its own rate-limit key has no rate limit. Attested, not
+    // inherited.
+    '        proxy_set_header X-Real-IP $remote_addr;',
     '        proxy_set_header X-FRA-Client-Subject "";',
     '        proxy_set_header X-FRA-Client-Serial "";',
     '        proxy_set_header X-FRA-Client-Fingerprint "";',

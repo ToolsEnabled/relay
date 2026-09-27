@@ -219,9 +219,57 @@ function createOnlineFraWebSocketAdapter(options = {}) {
    * the socket's peer, which is correct when there is no proxy and is the
    * conservative answer when there is one -- everybody shares a budget, which
    * is a service that refuses rather than a limit that does not apply. */
+  /* A CLIENT HEADER IS ONLY EVIDENCE IF A PROXY PUT IT THERE, and the socket tells
+     us whether there is a proxy. A connection arriving from loopback or from a
+     private range came from something on our side of the edge; one arriving from a
+     public address came from the internet, and every header on it is attacker
+     input including the ones we would like to trust.
+
+     PENTESTED, maxSocketsPerIp 3, eight connections from one source: with no proxy
+     attesting an address, rotating X-Real-IP gave 8 upgrades against a cap of 3.
+     The socket's own peer was right there and strictly better than the header, and
+     was consulted only as a fallback.
+
+     This is a heuristic about topology and it is the conservative direction: a
+     deployment whose proxy sits on a PUBLIC address stops honouring its headers and
+     everybody shares that proxy's budget -- a service that refuses rather than a
+     limit that does not apply, which is the trade the comment below already names.
+     The hosted relay proxies from 127.0.0.1, so nothing about it changes. */
+  function proxiedFrom(address) {
+    if (typeof address !== 'string' || !address) return false;
+    const value = address.startsWith('::ffff:') ? address.slice(7) : address;
+    if (value === '::1' || value === '0.0.0.0' || value === '::') return true;
+    if (net.isIP(value) === 6) return /^(?:fc|fd)[0-9a-f]{2}:/i.test(value) || /^fe80:/i.test(value);
+    if (net.isIP(value) !== 4) return false;
+    const [a, b] = value.split('.').map(Number);
+    return a === 127 || a === 10 || (a === 192 && b === 168) || (a === 172 && b >= 16 && b <= 31)
+      || (a === 169 && b === 254);
+  }
+
   function defaultClientIp(req) {
+    const peer = req && req.socket ? req.socket.remoteAddress : null;
+    // Not proxied: the peer IS the client, and no header can improve on it.
+    if (!proxiedFrom(peer)) return peer;
     const headers = req && req.headers ? req.headers : {};
-    for (const name of ['x-real-ip', 'x-fra-client-address']) {
+    /* ORDER MATTERS, AND IT WAS THE WRONG WAY ROUND. `x-real-ip` was read FIRST,
+       and the vhost THIS REPOSITORY RENDERS does not set it -- it sets
+       X-FRA-Client-Address and nothing else (online-fra-nginx-config.js). nginx
+       passes through a client header it does not itself set, so a self-hoster
+       following our own reference config trusted whatever the CLIENT sent in
+       X-Real-IP, ahead of the address nginx had just attested.
+
+       PENTESTED on the published tree, maxSocketsPerIp 3: eight connections from
+       one source address, no header, gave 3 upgrades and the cap held. The same
+       eight rotating X-Real-IP gave 8 -- the per-IP limit gone, and with it the
+       socket and admission exhaustion guards that limit exists to provide.
+
+       Preferring the header this project's own proxy sets closes that, and costs
+       nothing to a deployment behind a proxy that sets only X-Real-IP: that
+       header is still read, just second. The hosted relay was never exposed --
+       its nginx hand-sets X-Real-IP, which overwrites a client's -- and the
+       renderer now emits that line too, so both names are attested rather than
+       one being attested and the other spoofable. */
+    for (const name of ['x-fra-client-address', 'x-real-ip']) {
       const value = headers[name];
       if (typeof value === 'string' && safeIp(value.trim())) return value.trim();
     }

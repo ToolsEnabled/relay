@@ -383,12 +383,20 @@ function verifyNginxDeployment(options = {}) {
   checkUnique(endpoint.children, 'proxy_http_version', ['1.1'], 'ONLINE_FRA_NGINX_ROUTE_INVALID');
   checkExactOne(endpoint.children, 'proxy_set_header', ['Upgrade', '$http_upgrade'], 'ONLINE_FRA_NGINX_ROUTE_INVALID');
   const headers = direct(endpoint.children, 'proxy_set_header');
-  if (headers.length !== 12) fail('ONLINE_FRA_NGINX_ROUTE_INVALID');
+  if (headers.length !== 13) fail('ONLINE_FRA_NGINX_ROUTE_INVALID');
   checkHeader(headers, 'Connection', 'upgrade', 'ONLINE_FRA_NGINX_ROUTE_INVALID');
   checkHeader(headers, 'Host', relayHostname, 'ONLINE_FRA_NGINX_ROUTE_INVALID');
   checkHeader(headers, 'X-FRA-Client-Verify', '$ssl_client_verify', 'ONLINE_FRA_NGINX_ROUTE_INVALID');
   checkHeader(headers, 'X-FRA-Client-Certificate', '$ssl_client_escaped_cert', 'ONLINE_FRA_NGINX_IDENTITY_MAPPING_INVALID');
   checkHeader(headers, 'X-FRA-Client-Address', '$remote_addr', 'ONLINE_FRA_NGINX_IDENTITY_MAPPING_INVALID');
+  /* EVERY HEADER THE EDGE TRUSTS MUST BE ATTESTED HERE, and X-Real-IP was not.
+     online-fra-websocket-adapter.js reads both X-FRA-Client-Address and X-Real-IP
+     for the per-IP budget. A header this vhost does not SET is one nginx forwards
+     from the client, so leaving X-Real-IP unset made it attacker-chosen -- measured
+     on the published tree as a complete per-IP limit bypass. Requiring it here is
+     what makes "the edge only trusts attested addresses" a checked property of a
+     deployment rather than a convention somebody has to remember. */
+  checkHeader(headers, 'X-Real-IP', '$remote_addr', 'ONLINE_FRA_NGINX_IDENTITY_MAPPING_INVALID');
   checkHeader(headers, 'X-FRA-Max-Frame-Bytes', String(maxFrameBytes), 'ONLINE_FRA_NGINX_ROUTE_INVALID');
   // These names are cleared rather than relayed. The backend's sole certificate
   // identity input is the server-derived escaped leaf certificate above; it

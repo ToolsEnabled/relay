@@ -73,6 +73,7 @@ http {
       proxy_set_header X-FRA-Client-Verify $ssl_client_verify;
       proxy_set_header X-FRA-Client-Certificate $ssl_client_escaped_cert;
       proxy_set_header X-FRA-Client-Address $remote_addr;
+      proxy_set_header X-Real-IP $remote_addr;
       proxy_set_header X-FRA-Max-Frame-Bytes ${values.frame};
       proxy_set_header X-FRA-Client-Subject "";
       proxy_set_header X-FRA-Client-Serial "";
